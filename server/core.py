@@ -78,6 +78,8 @@ def ingest_telemetry(db_path, device_id, msg_id, seq, temp, device_ts, now):
     """接入一条温度数据。
 
     - 按 (device_id, msg_id) 唯一约束去重：重复消息/补报重发不会重复入库、重复报警；
+    - 仅实时样本（到达时刻≈采样时刻）更新设备在线状态：置在线并自动关闭挂着的离线告警；
+      断网补传的历史样本不碰在线状态/心跳——它证明不了链路此刻已恢复；
     - 越限时：有未关闭告警则并入（延长窗口、刷峰值），不新建；
       最近的同类告警已 RESOLVED 且样本落在其异常窗口内 → 记 LATE_DATA，绝不开新单；
       否则是真正的新一次异常，开新告警。
@@ -98,7 +100,10 @@ def ingest_telemetry(db_path, device_id, msg_id, seq, temp, device_ts, now):
             " VALUES (?,?,?,?,?,?,?,?)",
             (device_id, ship["id"], msg_id, seq, temp, device_ts, now, backfilled),
         )
-        _touch_device(conn, device_id, now)
+        if not backfilled:
+            # 只有实时样本能证明链路此刻是通的：置在线并顺带关闭挂着的离线告警。
+            # 断网补传的是历史样本，不碰在线状态/心跳，避免“设备在线、离线单却开着”的状态翻转。
+            _mark_online(conn, device_id, now, source="telemetry")
         if cur.rowcount == 0:
             conn.commit()
             return {"accepted": True, "duplicated": True}
@@ -189,23 +194,7 @@ def set_device_online(db_path, device_id, online, now, source="status"):
         conn.execute("BEGIN IMMEDIATE")
         prev = conn.execute("SELECT * FROM device_state WHERE device_id=?", (device_id,)).fetchone()
         if online:
-            conn.execute(
-                "INSERT INTO device_state(device_id, online, last_seen) VALUES (?,1,?)"
-                " ON CONFLICT(device_id) DO UPDATE SET online=1, last_seen=excluded.last_seen",
-                (device_id, now),
-            )
-            if not prev or not prev["online"]:
-                rows = conn.execute(
-                    f"SELECT * FROM alerts WHERE device_id=? AND type='OFFLINE'"
-                    f" AND status IN ({','.join('?' * len(OPEN_STATUSES))})",
-                    (device_id, *OPEN_STATUSES),
-                ).fetchall()
-                for a in rows:
-                    conn.execute(
-                        "UPDATE alerts SET status='RESOLVED', resolved_at=? WHERE id=?", (now, a["id"])
-                    )
-                    _add_event(conn, a["id"], "AUTO_RESOLVED", "system",
-                               f"设备恢复在线（{source}），离线告警自动关闭", now)
+            _mark_online(conn, device_id, now, source=source)
         else:
             conn.execute(
                 "INSERT INTO device_state(device_id, online, last_seen) VALUES (?,0,?)"
@@ -246,12 +235,32 @@ def check_timeouts(db_path, now):
             set_device_online(db_path, r["device_id"], False, now, source="watchdog")
 
 
-def _touch_device(conn, device_id, now):
+def _mark_online(conn, device_id, now, source):
+    """标记设备在线（实时数据或 online 状态消息调用）。
+
+    在线状态发生 离线→在线 跳变时，自动关闭该设备所有未关闭的 OFFLINE 告警并留痕，
+    保证设备状态与告警状态一致。调用方需已持有事务。
+    """
+    prev = conn.execute(
+        "SELECT * FROM device_state WHERE device_id=?", (device_id,)
+    ).fetchone()
     conn.execute(
         "INSERT INTO device_state(device_id, online, last_seen) VALUES (?,1,?)"
         " ON CONFLICT(device_id) DO UPDATE SET online=1, last_seen=excluded.last_seen",
         (device_id, now),
     )
+    if not prev or not prev["online"]:
+        rows = conn.execute(
+            f"SELECT * FROM alerts WHERE device_id=? AND type='OFFLINE'"
+            f" AND status IN ({','.join('?' * len(OPEN_STATUSES))})",
+            (device_id, *OPEN_STATUSES),
+        ).fetchall()
+        for a in rows:
+            conn.execute(
+                "UPDATE alerts SET status='RESOLVED', resolved_at=? WHERE id=?", (now, a["id"])
+            )
+            _add_event(conn, a["id"], "AUTO_RESOLVED", "system",
+                       f"设备恢复在线（{source}），离线告警自动关闭", now)
 
 
 def list_devices(db_path):
