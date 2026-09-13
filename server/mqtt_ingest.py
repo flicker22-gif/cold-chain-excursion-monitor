@@ -57,11 +57,12 @@ def start_ingest(db_path, host="127.0.0.1", port=1883):
 
 
 def start_watchdog(db_path, interval=0.5):
-    """周期检查设备心跳超时，兜底 LWT 之外的离线场景。"""
+    """周期检查：设备心跳超时判离线（兜底 LWT）；未处理告警沿升级链自动升级。"""
     def loop():
         while True:
             try:
                 core.check_timeouts(db_path, time.time())
+                core.check_escalations(db_path, time.time())
             except Exception:
                 pass  # 看门狗不允许把服务搞挂
             time.sleep(interval)

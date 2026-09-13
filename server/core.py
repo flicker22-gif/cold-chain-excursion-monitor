@@ -1,8 +1,9 @@
-"""核心业务逻辑：温度判定、告警生命周期、去重、迟到数据合并、离线看门狗。
+"""核心业务逻辑：温度判定、告警分级与生命周期、超时自动升级、去重、迟到数据合并、离线看门狗。
 
 所有函数接收显式的 `now`（epoch 秒），单测可以注入确定性时间。
 每个函数自开自关事务（BEGIN IMMEDIATE），MQTT 线程 / HTTP 线程 / 看门狗线程并发安全。
 """
+import json
 import sqlite3
 
 from . import db as dbmod
@@ -10,14 +11,26 @@ from . import db as dbmod
 OPEN_STATUSES = ("OPEN", "ACKED", "ESCALATED")
 
 # 告警状态机：合法迁移。RESOLVED 是终态——已处理的异常不能被任何数据改回。
+# ack 允许从 ESCALATED 确认（升级不妨碍“我来处理”）；escalate 允许在 ESCALATED
+# 上重复执行，以便沿升级链继续往上推。
 _TRANSITIONS = {
-    "ack":      {"from": {"OPEN"}, "to": "ACKED", "event": "ACKED"},
-    "escalate": {"from": {"OPEN", "ACKED"}, "to": "ESCALATED", "event": "ESCALATED"},
+    "ack":      {"from": {"OPEN", "ESCALATED"}, "to": "ACKED", "event": "ACKED"},
+    "escalate": {"from": {"OPEN", "ACKED", "ESCALATED"}, "to": "ESCALATED", "event": "ESCALATED"},
     "resolve":  {"from": {"OPEN", "ACKED", "ESCALATED"}, "to": "RESOLVED", "event": "RESOLVED"},
 }
 
 # 到达时刻比采样时刻晚超过该值，视为断网期间的补传数据
 BACKFILL_AGE_SEC = 1.0
+
+# 温度告警分级：偏差（℃）或持续时长（秒）任一达到阈值即定该级；级别只升不降。
+SEVERITY_LEVELS = ("L1", "L2", "L3")
+SEVERITY_LABELS = {"L1": "提示", "L2": "严重", "L3": "紧急"}
+SEVERITY_RULES = {
+    "L2": {"deviation": 2.0, "duration": 120.0},
+    "L3": {"deviation": 4.0, "duration": 300.0},
+}
+# 在途失联没有温度梯度可言，固定按“严重”定级
+OFFLINE_SEVERITY = "L2"
 
 
 class DomainError(Exception):
@@ -26,9 +39,13 @@ class DomainError(Exception):
 
 # ---------------------------------------------------------------- 运输任务
 
-def create_shipment(db_path, name, device_id, temp_min, temp_max, offline_grace_sec, now):
+def create_shipment(db_path, name, device_id, temp_min, temp_max, offline_grace_sec, now,
+                    escalation_chain=None, escalate_after_sec=60.0):
     if temp_min >= temp_max:
         raise DomainError("temp_min 必须小于 temp_max")
+    chain = [str(x).strip() for x in (escalation_chain or []) if str(x).strip()]
+    if escalate_after_sec <= 0:
+        raise DomainError("escalate_after_sec 必须大于 0")
     with dbmod.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         dup = conn.execute(
@@ -37,9 +54,10 @@ def create_shipment(db_path, name, device_id, temp_min, temp_max, offline_grace_
         if dup:  # 同一台车同时只能有一个在途任务，重复创建返回已有任务（幂等）
             return get_shipment(db_path, dup["id"])
         cur = conn.execute(
-            "INSERT INTO shipments(name, device_id, temp_min, temp_max, offline_grace_sec, created_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (name, device_id, temp_min, temp_max, offline_grace_sec, now),
+            "INSERT INTO shipments(name, device_id, temp_min, temp_max, offline_grace_sec,"
+            " escalation_chain, escalate_after_sec, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, device_id, temp_min, temp_max, offline_grace_sec,
+             json.dumps(chain, ensure_ascii=False), escalate_after_sec, now),
         )
         conn.commit()
         return get_shipment(db_path, cur.lastrowid)
@@ -127,10 +145,12 @@ def _on_violation(conn, ship, alert_type, temp, ts, now):
     ).fetchone()
     if open_alert:
         _merge_into_alert(conn, open_alert, temp, ts)
+        _refresh_severity(conn, ship, open_alert["id"], now)
         return {"alert_id": open_alert["id"], "merged": True}
 
     # 迟到数据：采样时刻落在某张已处理告警的异常窗口内 → 属于那次已处理的异常，
-    # 修正统计、留痕，但状态保持 RESOLVED，绝不开新单。
+    # 修正统计、留痕，但状态保持 RESOLVED，绝不开新单；级别/负责人/通知记录也
+    # 一并冻结——已处理的异常不能被旧数据重新升级。
     resolved = conn.execute(
         "SELECT * FROM alerts WHERE shipment_id=? AND type=? AND status='RESOLVED'"
         " AND first_ts<=? AND last_ts>=? ORDER BY id DESC LIMIT 1",
@@ -140,18 +160,26 @@ def _on_violation(conn, ship, alert_type, temp, ts, now):
         _merge_into_alert(conn, resolved, temp, ts)
         _add_event(
             conn, resolved["id"], "LATE_DATA", "system",
-            f"迟到数据并入已处理告警（temp={temp}℃, device_ts={ts:.3f}），状态不变", now,
+            f"迟到数据并入已处理告警（temp={temp}℃, device_ts={ts:.3f}），状态与级别不变", now,
         )
         return {"alert_id": resolved["id"], "late": True}
 
+    severity = _classify_temp(alert_type, temp, 0.0, ship)
+    chain = _chain_of(ship)
+    assignee = chain[0] if chain else None
     cur = conn.execute(
-        "INSERT INTO alerts(shipment_id, device_id, type, opened_at, first_ts, last_ts, peak_temp, detail)"
-        " VALUES (?,?,?,?,?,?,?,?)",
-        (ship["id"], ship["device_id"], alert_type, now, ts, ts, temp,
+        "INSERT INTO alerts(shipment_id, device_id, type, severity, assignee, assignee_idx,"
+        " assignee_since, opened_at, first_ts, last_ts, peak_temp, detail)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (ship["id"], ship["device_id"], alert_type, severity, assignee, 0,
+         now if assignee else None, now, ts, ts, temp,
          f"温度越{'上' if alert_type == 'TEMP_HIGH' else '下'}限"),
     )
     _add_event(conn, cur.lastrowid, "OPENED", "system",
-               f"温度 {temp}℃ 越限（阈值 {ship['temp_min']}~{ship['temp_max']}℃）", now)
+               f"温度 {temp}℃ 越限（阈值 {ship['temp_min']}~{ship['temp_max']}℃），"
+               f"定级 {severity}·{SEVERITY_LABELS[severity]}"
+               + (f"，负责人 {assignee}" if assignee else ""), now)
+    _maybe_notify(conn, cur.lastrowid, now)
     return {"alert_id": cur.lastrowid, "opened": True}
 
 
@@ -165,6 +193,67 @@ def _merge_into_alert(conn, alert, temp, ts):
     conn.execute(
         "UPDATE alerts SET first_ts=MIN(first_ts, ?), last_ts=MAX(last_ts, ?), peak_temp=? WHERE id=?",
         (ts, ts, peak, alert["id"]),
+    )
+
+
+# ---------------------------------------------------------------- 分级与通知
+
+def _chain_of(ship):
+    return json.loads(ship["escalation_chain"] or "[]")
+
+
+def _classify_temp(alert_type, peak_temp, duration_sec, ship):
+    """按温度偏差与持续时长定级（L1/L2/L3）。"""
+    if alert_type == "TEMP_HIGH":
+        deviation = peak_temp - ship["temp_max"]
+    else:
+        deviation = ship["temp_min"] - peak_temp
+    level = "L1"
+    for lv in ("L2", "L3"):
+        rule = SEVERITY_RULES[lv]
+        if deviation >= rule["deviation"] or duration_sec >= rule["duration"]:
+            level = lv
+    return level
+
+
+def _refresh_severity(conn, ship, alert_id, now):
+    """未关闭告警并入新越限样本后重算级别：只升不降，升级留痕并通知现任负责人。"""
+    a = conn.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone()
+    if not a or a["status"] not in OPEN_STATUSES or a["type"] == "OFFLINE":
+        return
+    duration = a["last_ts"] - a["first_ts"]
+    new = _classify_temp(a["type"], a["peak_temp"], duration, ship)
+    if SEVERITY_LEVELS.index(new) <= SEVERITY_LEVELS.index(a["severity"]):
+        return
+    if a["type"] == "TEMP_HIGH":
+        deviation = a["peak_temp"] - ship["temp_max"]
+    else:
+        deviation = ship["temp_min"] - a["peak_temp"]
+    conn.execute("UPDATE alerts SET severity=? WHERE id=?", (new, alert_id))
+    _add_event(conn, alert_id, "LEVEL_UP", "system",
+               f"级别上升 {a['severity']} → {new}（偏差 {deviation:.1f}℃，持续 {duration:.0f}s）", now)
+    _maybe_notify(conn, alert_id, now)
+
+
+def _maybe_notify(conn, alert_id, now):
+    """给现任负责人发通知。同一告警的 (级别, 负责人) 组合只通知一次——
+    同一异常不重复发同级通知；级别上升或负责人更换时才再发。"""
+    a = conn.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone()
+    if not a or not a["assignee"]:
+        return
+    if (a["notified_severity"] == a["severity"]
+            and a["notified_assignee_idx"] == a["assignee_idx"]):
+        return
+    label = f"{a['severity']}·{SEVERITY_LABELS[a['severity']]}"
+    if a["type"] == "OFFLINE":
+        text = f"通知 {a['assignee']}：设备离线（{label}）"
+    else:
+        text = (f"通知 {a['assignee']}：{a['type']} 告警 {label}"
+                f"（峰值 {a['peak_temp']}℃，已持续 {a['last_ts'] - a['first_ts']:.0f}s）")
+    _add_event(conn, alert_id, "NOTIFY", "system", text, now)
+    conn.execute(
+        "UPDATE alerts SET notified_severity=?, notified_assignee_idx=? WHERE id=?",
+        (a["severity"], a["assignee_idx"], alert_id),
     )
 
 
@@ -208,14 +297,20 @@ def set_device_online(db_path, device_id, online, now, source="status"):
                     (device_id,),
                 ).fetchone()
                 if ship:
+                    chain = _chain_of(ship)
+                    assignee = chain[0] if chain else None
                     cur = conn.execute(
-                        "INSERT INTO alerts(shipment_id, device_id, type, opened_at, first_ts, last_ts, detail)"
-                        " VALUES (?,?,?,?,?,?,?)",
-                        (ship["id"], device_id, "OFFLINE", now, now, now,
-                         f"设备离线（{source}）"),
+                        "INSERT INTO alerts(shipment_id, device_id, type, severity, assignee,"
+                        " assignee_idx, assignee_since, opened_at, first_ts, last_ts, detail)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (ship["id"], device_id, "OFFLINE", OFFLINE_SEVERITY, assignee, 0,
+                         now if assignee else None, now, now, now, f"设备离线（{source}）"),
                     )
                     _add_event(conn, cur.lastrowid, "OPENED", "system",
-                               f"设备离线，超过 {ship['offline_grace_sec']}s 无数据（{source}）", now)
+                               f"设备离线，超过 {ship['offline_grace_sec']}s 无数据（{source}），"
+                               f"定级 {OFFLINE_SEVERITY}·{SEVERITY_LABELS[OFFLINE_SEVERITY]}"
+                               + (f"，负责人 {assignee}" if assignee else ""), now)
+                    _maybe_notify(conn, cur.lastrowid, now)
         conn.commit()
 
 
@@ -233,6 +328,55 @@ def check_timeouts(db_path, now):
     for r in rows:
         if r["last_seen"] is not None and now - r["last_seen"] > r["offline_grace_sec"]:
             set_device_online(db_path, r["device_id"], False, now, source="watchdog")
+
+
+def check_escalations(db_path, now):
+    """升级看门狗：未关闭告警的现任负责人超过 escalate_after_sec 没处理完 →
+    自动升级给链上的下一位负责人并通知。
+
+    只扫描 OPEN/ACKED/ESCALATED 且任务在途的告警：RESOLVED 是终态，已处理的
+    异常绝不会被（含迟到数据在内的）任何机制重新升级；确认/记录不暂停计时，
+    只有关闭或任务完成才停止。
+    """
+    with dbmod.connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT a.id FROM alerts a"
+            f" JOIN shipments s ON s.id=a.shipment_id AND s.status='IN_TRANSIT'"
+            f" WHERE a.status IN ({','.join('?' * len(OPEN_STATUSES))})",
+            OPEN_STATUSES,
+        ).fetchall()
+    for r in rows:
+        _auto_escalate(db_path, r["id"], now)
+
+
+def _auto_escalate(db_path, alert_id, now):
+    with dbmod.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        a = conn.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone()
+        if not a or a["status"] not in OPEN_STATUSES:
+            return  # 扫描后被人工处理掉了
+        ship = conn.execute(
+            "SELECT * FROM shipments WHERE id=? AND status='IN_TRANSIT'", (a["shipment_id"],)
+        ).fetchone()
+        if not ship:
+            return
+        chain = _chain_of(ship)
+        idx = a["assignee_idx"] + 1
+        if not chain or idx >= len(chain):
+            return  # 无升级链，或已在最高负责人处
+        since = a["assignee_since"] if a["assignee_since"] is not None else a["opened_at"]
+        if now - since < ship["escalate_after_sec"]:
+            return  # 现任负责人还没超时
+        conn.execute(
+            "UPDATE alerts SET status='ESCALATED', assignee_idx=?, assignee=?, assignee_since=?"
+            " WHERE id=?",
+            (idx, chain[idx], now, alert_id),
+        )
+        _add_event(conn, alert_id, "ESCALATED", "system",
+                   f"超过 {ship['escalate_after_sec']:.0f}s 未处理完，自动升级："
+                   f"负责人 → {chain[idx]}", now)
+        _maybe_notify(conn, alert_id, now)
+        conn.commit()
 
 
 def _mark_online(conn, device_id, now, source):
@@ -272,7 +416,11 @@ def list_devices(db_path):
 # ---------------------------------------------------------------- 告警处理
 
 def transition_alert(db_path, alert_id, op, actor, note, now):
-    """确认 / 升级 / 关闭。非法迁移（含操作已关闭告警）抛 DomainError。"""
+    """确认 / 升级 / 关闭。非法迁移（含操作已关闭告警）抛 DomainError。
+
+    手动升级会沿任务配置的升级链把负责人推进一位并通知新负责人；
+    已在链顶则只记升级事件，负责人不变。
+    """
     if op not in _TRANSITIONS:
         raise DomainError(f"未知操作: {op}")
     rule = _TRANSITIONS[op]
@@ -288,7 +436,21 @@ def transition_alert(db_path, alert_id, op, actor, note, now):
             "UPDATE alerts SET status=?, resolved_at=COALESCE(?, resolved_at) WHERE id=?",
             (rule["to"], resolved_at, alert_id),
         )
+        if op == "escalate":
+            ship = conn.execute(
+                "SELECT * FROM shipments WHERE id=?", (a["shipment_id"],)
+            ).fetchone()
+            chain = _chain_of(ship)
+            idx = a["assignee_idx"] + 1
+            if chain and idx < len(chain):
+                conn.execute(
+                    "UPDATE alerts SET assignee_idx=?, assignee=?, assignee_since=? WHERE id=?",
+                    (idx, chain[idx], now, alert_id),
+                )
+                note = (note + "；" if note else "") + f"负责人 → {chain[idx]}"
         _add_event(conn, alert_id, rule["event"], actor, note, now)
+        if op == "escalate":
+            _maybe_notify(conn, alert_id, now)
         conn.commit()
         return get_alert(db_path, alert_id)
 

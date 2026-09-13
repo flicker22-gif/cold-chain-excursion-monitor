@@ -24,11 +24,16 @@ def _err(e):
 @app.post("/api/shipments")
 def create_shipment():
     b = request.get_json(force=True)
+    chain = b.get("escalation_chain") or []
+    if isinstance(chain, str):  # 也接受逗号分隔的字符串
+        chain = [x.strip() for x in chain.replace("，", ",").split(",") if x.strip()]
     try:
         s = core.create_shipment(
             DB_PATH, b["name"], b["device_id"],
             float(b["temp_min"]), float(b["temp_max"]),
             float(b.get("offline_grace_sec", 5.0)), time.time(),
+            escalation_chain=chain,
+            escalate_after_sec=float(b.get("escalate_after_sec", 60.0)),
         )
         return jsonify(s), 201
     except (KeyError, ValueError) as e:
@@ -120,6 +125,7 @@ _DASHBOARD_HTML = """<!doctype html>
  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff}
  .OPEN{background:#d4380d}.ACKED{background:#d48806}.ESCALATED{background:#722ed1}.RESOLVED{background:#389e0d}
  .TEMP_HIGH{background:#cf1322}.TEMP_LOW{background:#096dd9}.OFFLINE{background:#595959}
+ .L1{background:#faad14}.L2{background:#fa541c}.L3{background:#cf1322}
  button{margin-right:6px;padding:3px 10px;border:1px solid #bbb;border-radius:5px;background:#fff;cursor:pointer}
  button:hover{background:#eef}
  table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #eee;padding:4px 8px;font-size:13px;text-align:left}
@@ -135,6 +141,8 @@ _DASHBOARD_HTML = """<!doctype html>
  <input id="sdev" placeholder="设备号" value="truck-01" size="10">
  <input id="smin" type="number" step="0.1" value="2" style="width:60px"> ~
  <input id="smax" type="number" step="0.1" value="8" style="width:60px"> ℃
+ <input id="schain" placeholder="负责人链(逗号分隔)" value="调度员-王,值班经理-李,运营总监-赵" size="22">
+ <input id="swait" type="number" step="1" value="60" style="width:52px" title="超过该秒数未处理完自动升级下一位"> s升级
  <button onclick="createShipment()">创建并发车</button>
  <span id="msg"></span>
 </div></div>
@@ -154,7 +162,9 @@ async function api(p, m, body){
 }
 async function createShipment(){
   const s = await api('/api/shipments','POST',{name:sname.value, device_id:sdev.value,
-    temp_min:+smin.value, temp_max:+smax.value, offline_grace_sec:3});
+    temp_min:+smin.value, temp_max:+smax.value, offline_grace_sec:3,
+    escalation_chain:schain.value.split(/[,，]/).map(x=>x.trim()).filter(Boolean),
+    escalate_after_sec:+swait.value});
   document.getElementById('msg').textContent = '已创建 #' + s.id; load();
 }
 async function op(id, op){
@@ -167,15 +177,18 @@ async function load(){
   const ships = await api('/api/shipments');
   document.getElementById('ships').innerHTML = ships.map(s=>`<div class="card"><div class="row">
     <b>#${s.id} ${s.name}</b><span>${s.device_id}</span><span>阈值 ${s.temp_min}~${s.temp_max}℃</span>
+    <span>升级链 ${JSON.parse(s.escalation_chain||'[]').join(' → ')||'—'}（${s.escalate_after_sec}s）</span>
     <span class="tag ${s.status==='IN_TRANSIT'?'OPEN':'RESOLVED'}">${s.status}</span>
     ${s.status==='IN_TRANSIT'?`<button onclick="api('/api/shipments/${s.id}/complete','POST').then(load)">完成任务</button>`:''}
   </div></div>`).join('') || '<i>暂无任务</i>';
   document.getElementById('tlship').innerHTML = ships.map(s=>`<option value="${s.id}">#${s.id} ${s.name}</option>`).join('');
   const alerts = await api('/api/alerts');
-  document.getElementById('alerts').innerHTML = alerts.length ? '<table><tr><th>ID</th><th>任务</th><th>类型</th><th>状态</th><th>峰值</th><th>开窗时间</th><th>操作</th></tr>' +
+  document.getElementById('alerts').innerHTML = alerts.length ? '<table><tr><th>ID</th><th>任务</th><th>类型</th><th>级别</th><th>状态</th><th>负责人</th><th>峰值</th><th>开窗时间</th><th>操作</th></tr>' +
     alerts.map(a=>`<tr><td>${a.id}</td><td>#${a.shipment_id}</td>
       <td><span class="tag ${a.type}">${a.type}</span></td>
+      <td><span class="tag ${a.severity}">${a.severity}</span></td>
       <td><span class="tag ${a.status}">${a.status}</span></td>
+      <td>${a.assignee||'—'}</td>
       <td>${a.peak_temp??''}</td><td>${fmt(a.opened_at)}</td><td>
       ${a.status!=='RESOLVED'?`
         <button onclick="op(${a.id},'ack')">确认</button>

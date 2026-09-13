@@ -230,6 +230,190 @@ class TestBackfillOfflineConsistency(CoreTestBase):
         self.assertLessEqual(core.list_devices(self.db)[0]["last_seen"], 1005.0)
 
 
+class ChainTestBase(CoreTestBase):
+    """另建一个带负责人升级链的任务（dev-2）：链 调度-A → 主管-B → 总监-C，10s 未处理完升级。"""
+
+    def setUp(self):
+        super().setUp()
+        self.ship2 = core.create_shipment(
+            self.db, "冷链专车", "dev-2", 2.0, 8.0, 5.0, now=1000.0,
+            escalation_chain=["调度-A", "主管-B", "总监-C"], escalate_after_sec=10.0)
+        self.sid2 = self.ship2["id"]
+
+    def send2(self, msg_id, temp, ts, now=None):
+        return core.ingest_telemetry(self.db, "dev-2", msg_id, seq=None,
+                                     temp=temp, device_ts=ts, now=now if now is not None else ts)
+
+    def open_alert2(self, msg_id="m1", temp=9.0, ts=1001.0):
+        self.send2(msg_id, temp, ts)
+        return next(a for a in core.list_alerts(self.db, shipment_id=self.sid2))
+
+
+class TestSeverity(CoreTestBase):
+    def test_severity_upgrades_with_deviation(self):
+        self.send("m1", 8.5, 1001.0)   # 偏差 0.5℃ → L1
+        a = core.list_alerts(self.db)[0]
+        self.assertEqual(a["severity"], "L1")
+        self.send("m2", 10.5, 1002.0)  # 偏差 2.5℃ → L2
+        self.send("m3", 12.5, 1003.0)  # 偏差 4.5℃ → L3
+        a = core.get_alert(self.db, a["id"])
+        self.assertEqual(a["severity"], "L3")
+        ups = [e for e in a["events"] if e["action"] == "LEVEL_UP"]
+        self.assertEqual(len(ups), 2)  # L1→L2→L3 各留痕一次
+
+    def test_severity_upgrades_with_duration(self):
+        self.send("m1", 8.5, 1001.0)
+        a = core.list_alerts(self.db)[0]
+        self.send("m2", 8.6, 1121.0)   # 持续 120s → L2
+        self.assertEqual(core.get_alert(self.db, a["id"])["severity"], "L2")
+        self.send("m3", 8.6, 1311.0)   # 持续 310s → L3
+        self.assertEqual(core.get_alert(self.db, a["id"])["severity"], "L3")
+
+    def test_severity_never_downgrades(self):
+        self.send("m1", 10.5, 1001.0)  # 开单即 L2
+        a = core.list_alerts(self.db)[0]
+        self.assertEqual(a["severity"], "L2")
+        self.send("m2", 8.5, 1002.0)   # 偏差回落但仍越限 → 并入，级别不降
+        a = core.get_alert(self.db, a["id"])
+        self.assertEqual(a["severity"], "L2")
+        self.assertFalse(any(e["action"] == "LEVEL_DOWN" for e in a["events"]))
+
+    def test_low_temp_deviation_grading(self):
+        self.send("m1", -1.0, 1001.0)  # 低于下限 3℃ → L2
+        a = core.list_alerts(self.db)[0]
+        self.assertEqual((a["type"], a["severity"]), ("TEMP_LOW", "L2"))
+
+
+class TestNotify(ChainTestBase):
+    def test_notify_once_per_level_and_assignee(self):
+        a = self.open_alert2()         # L1，通知 调度-A
+        notifies = [e for e in core.get_alert(self.db, a["id"])["events"]
+                    if e["action"] == "NOTIFY"]
+        self.assertEqual(len(notifies), 1)
+        self.assertIn("调度-A", notifies[0]["note"])
+
+        self.send2("m2", 8.6, 1002.0)  # 同级继续越限 → 不重复通知
+        self.send2("m3", 8.7, 1003.0)
+        notifies = [e for e in core.get_alert(self.db, a["id"])["events"]
+                    if e["action"] == "NOTIFY"]
+        self.assertEqual(len(notifies), 1)
+
+        self.send2("m4", 10.5, 1004.0)  # 级别上升 → 重新通知现任负责人
+        notifies = [e for e in core.get_alert(self.db, a["id"])["events"]
+                    if e["action"] == "NOTIFY"]
+        self.assertEqual(len(notifies), 2)
+        self.assertIn("L2", notifies[1]["note"])
+
+    def test_no_chain_no_notify(self):
+        self.send("x1", 9.5, 1001.0)   # dev-1 的任务没有升级链
+        a = core.list_alerts(self.db, shipment_id=self.sid)[0]
+        self.assertIsNone(a["assignee"])
+        self.assertFalse(any(e["action"] == "NOTIFY"
+                             for e in core.get_alert(self.db, a["id"])["events"]))
+
+
+class TestEscalation(ChainTestBase):
+    def test_auto_escalates_along_chain_then_stops_at_top(self):
+        a = self.open_alert2()
+        self.assertEqual(a["assignee"], "调度-A")
+
+        core.check_escalations(self.db, now=1005.0)  # 未超 10s
+        self.assertEqual(core.get_alert(self.db, a["id"])["assignee"], "调度-A")
+
+        core.check_escalations(self.db, now=1012.0)  # 调度-A 超时 → 主管-B
+        a = core.get_alert(self.db, a["id"])
+        self.assertEqual((a["status"], a["assignee"]), ("ESCALATED", "主管-B"))
+
+        core.check_escalations(self.db, now=1023.0)  # 主管-B 超时 → 总监-C
+        a = core.get_alert(self.db, a["id"])
+        self.assertEqual(a["assignee"], "总监-C")
+        n_events = len(a["events"])
+
+        core.check_escalations(self.db, now=1040.0)  # 已到链顶，不再升级、不再通知
+        a = core.get_alert(self.db, a["id"])
+        self.assertEqual(a["assignee"], "总监-C")
+        self.assertEqual(len(a["events"]), n_events)
+
+        escalations = [e for e in a["events"] if e["action"] == "ESCALATED"]
+        self.assertTrue(all(e["actor"] == "system" for e in escalations))
+        notifies = [e for e in a["events"] if e["action"] == "NOTIFY"]
+        self.assertEqual(len(notifies), 3)  # 三位负责人各通知一次，同级不重复
+
+    def test_resolved_alert_is_never_escalated(self):
+        a = self.open_alert2()
+        core.transition_alert(self.db, a["id"], "resolve", "主管-B", "处理完", now=1003.0)
+        core.check_escalations(self.db, now=5000.0)
+        a = core.get_alert(self.db, a["id"])
+        self.assertEqual(a["status"], "RESOLVED")
+        self.assertEqual(a["assignee"], "调度-A")
+        self.assertFalse(any(e["action"] == "ESCALATED" for e in a["events"]))
+
+    def test_late_data_does_not_rearm_resolved_alert(self):
+        a = self.open_alert2()  # L1，负责人 调度-A
+        self.send2("m2", 9.2, 1002.0)  # 异常窗口扩到 [1001, 1002]
+        core.transition_alert(self.db, a["id"], "resolve", "主管-B", "处理完", now=1010.0)
+        before = core.get_alert(self.db, a["id"])
+
+        # 迟到数据落在已处理窗口内，且温度极端（若重算级别会到 L3）
+        r = self.send2("late-1", 15.0, 1001.5, now=1020.0)
+        self.assertTrue(r["alert"]["late"])
+        core.check_escalations(self.db, now=5000.0)
+
+        after = core.get_alert(self.db, a["id"])
+        self.assertEqual(after["status"], "RESOLVED")
+        self.assertEqual(after["peak_temp"], 15.0)            # 统计被修正
+        self.assertEqual(after["severity"], before["severity"])  # 级别冻结在关闭时
+        self.assertEqual(after["assignee"], before["assignee"])
+        new_actions = [e["action"] for e in after["events"][len(before["events"]):]]
+        self.assertEqual(new_actions, ["LATE_DATA"])          # 只留痕，不升级不通知
+
+    def test_manual_escalate_advances_assignee(self):
+        a = self.open_alert2()
+        a = core.transition_alert(self.db, a["id"], "escalate", "调度-A", "处理不了", now=1002.0)
+        self.assertEqual(a["assignee"], "主管-B")
+        notifies = [e for e in a["events"] if e["action"] == "NOTIFY"]
+        self.assertEqual(len(notifies), 2)  # 开单通知调度-A + 升级通知主管-B
+        self.assertIn("主管-B", notifies[1]["note"])
+
+        a = core.transition_alert(self.db, a["id"], "escalate", "主管-B", "", now=1003.0)
+        self.assertEqual(a["assignee"], "总监-C")
+        n_events = len(a["events"])
+        a = core.transition_alert(self.db, a["id"], "escalate", "总监-C", "", now=1004.0)
+        self.assertEqual(a["assignee"], "总监-C")  # 链顶：记事件但负责人不变、不重复通知
+        self.assertEqual(len(a["events"]), n_events + 1)
+
+    def test_ack_allowed_after_escalation(self):
+        a = self.open_alert2()
+        core.check_escalations(self.db, now=1012.0)  # 自动升级到 主管-B
+        a = core.transition_alert(self.db, a["id"], "ack", "主管-B", "我来处理", now=1013.0)
+        self.assertEqual(a["status"], "ACKED")
+
+    def test_completed_shipment_stops_escalation(self):
+        a = self.open_alert2()
+        core.complete_shipment(self.db, self.sid2, now=1002.0)
+        core.check_escalations(self.db, now=5000.0)
+        a = core.get_alert(self.db, a["id"])
+        self.assertEqual(a["assignee"], "调度-A")
+        self.assertFalse(any(e["action"] == "ESCALATED" for e in a["events"]))
+
+    def test_offline_alert_has_severity_and_escalates(self):
+        core.set_device_online(self.db, "dev-2", True, now=1000.0)
+        core.set_device_online(self.db, "dev-2", False, now=1005.0)
+        a = next(x for x in core.list_alerts(self.db, status="open") if x["type"] == "OFFLINE")
+        self.assertEqual((a["severity"], a["assignee"]), ("L2", "调度-A"))
+        self.assertTrue(any(e["action"] == "NOTIFY"
+                            for e in core.get_alert(self.db, a["id"])["events"]))
+
+        core.check_escalations(self.db, now=1016.0)  # 离线 11s 没人处理 → 升级
+        self.assertEqual(core.get_alert(self.db, a["id"])["assignee"], "主管-B")
+
+        core.set_device_online(self.db, "dev-2", True, now=1020.0)  # 恢复在线自动关闭
+        self.assertEqual(core.get_alert(self.db, a["id"])["status"], "RESOLVED")
+        n_events = len(core.get_alert(self.db, a["id"])["events"])
+        core.check_escalations(self.db, now=5000.0)  # 已关闭的离线单不再升级
+        self.assertEqual(len(core.get_alert(self.db, a["id"])["events"]), n_events)
+
+
 class TestStateMachine(CoreTestBase):
     def test_full_workflow(self):
         self.send("m1", 9.5, 1001.0)
