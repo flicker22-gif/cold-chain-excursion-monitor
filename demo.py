@@ -3,7 +3,8 @@
 场景：正常运输 → 超温告警（按偏差/持续分级 L1→L2，超时未处理沿负责人链自动升级，
 同级通知不重复）→ 处理关闭 → 断网（离线告警、本地缓存）→ 恢复（补传不丢、离线单
 自动关闭留恢复记录、超温单不被顺手关掉、重复上线幂等）→ 断网期间的严重超温开新单
-→ 重复消息去重 → 迟到数据并入已关闭告警（不重开、不重新升级）→ 完成任务，输出完整异常时间线。
+→ 重复消息去重 → 迟到数据并入已关闭告警（不重开、不重新升级）→ 完成任务
+→ 设备离线状态下创建下一趟：新任务继承离线状态，宽限期后告警，恢复后自动关闭。
 
   python3 demo.py
 """
@@ -186,6 +187,31 @@ def main():
             head = f"[告警#{it['alert_id']} {it['alert_type']}·{it['action']}" + \
                    (f"·{it['actor']}" if it.get("actor") else "") + "] "
         print(f"  +{it['ts'] - base:6.1f}s {kind_icon.get(it['kind'], '·')} {head}{it['text']}")
+
+    # 11. 上一趟结束后设备一直没联网：新任务继承离线状态，宽限期后告警
+    sim.connect()       # 设备短暂上线（上一趟已完成，无在途任务）
+    time.sleep(1.0)
+    sim.drop_network()  # 又掉了：LWT 置离线，但此时没有在途任务 → 不开单
+    time.sleep(1.0)
+    ship2 = api("/api/shipments", "POST", {
+        "name": "疫苗运输·沪A12345（返程）", "device_id": "truck-01",
+        "temp_min": 2.0, "temp_max": 8.0, "offline_grace_sec": 2.0,
+        "escalation_chain": ["调度员-王芳", "值班经理-李强", "运营总监-赵敏"],
+        "escalate_after_sec": 2.0})
+    log(f"设备仍离线，创建下一趟任务 #{ship2['id']} …")
+    off3 = wait_for("新任务继承离线告警", lambda: next(
+        (a for a in api(f"/api/alerts?shipment_id={ship2['id']}") if a["type"] == "OFFLINE"), None))
+    time.sleep(1.5)  # 看门狗重复检查
+    n_off = len([a for a in api(f"/api/alerts?shipment_id={ship2['id']}")
+                 if a["type"] == "OFFLINE"])
+    assert n_off == 1, "重复检查不能重复开单"
+    log(f"⚠ 告警 #{off3['id']} OFFLINE：新任务继承离线状态，宽限期后开单"
+        f"（负责人 {off3['assignee']}，重复检查仍只有 1 张）")
+    sim.connect()
+    wait_for("继承的离线告警自动关闭", lambda: api(f"/api/alerts/{off3['id']}")["status"] == "RESOLVED")
+    log("设备恢复上线，继承的离线告警自动关闭（AUTO_RESOLVED 留痕）✅")
+    sim.disconnect()
+    api(f"/api/shipments/{ship2['id']}/complete", "POST")
 
     print(f"\n看板地址（单独起服务可看实时页面）：python3 -m server.app --with-broker")
     print("演示结束。")

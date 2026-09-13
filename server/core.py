@@ -297,27 +297,38 @@ def set_device_online(db_path, device_id, online, now, source="status"):
                     (device_id,),
                 ).fetchone()
                 if ship:
-                    chain = _chain_of(ship)
-                    assignee = chain[0] if chain else None
-                    cur = conn.execute(
-                        "INSERT INTO alerts(shipment_id, device_id, type, severity, assignee,"
-                        " assignee_idx, assignee_since, opened_at, first_ts, last_ts, detail)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        (ship["id"], device_id, "OFFLINE", OFFLINE_SEVERITY, assignee, 0,
-                         now if assignee else None, now, now, now, f"设备离线（{source}）"),
-                    )
-                    _add_event(conn, cur.lastrowid, "OPENED", "system",
-                               f"设备离线，超过 {ship['offline_grace_sec']}s 无数据（{source}），"
-                               f"定级 {OFFLINE_SEVERITY}·{SEVERITY_LABELS[OFFLINE_SEVERITY]}"
-                               + (f"，负责人 {assignee}" if assignee else ""), now)
-                    _maybe_notify(conn, cur.lastrowid, now)
+                    _open_offline_alert(
+                        conn, ship, now,
+                        note=f"设备离线，超过 {ship['offline_grace_sec']}s 无数据（{source}）")
         conn.commit()
 
 
-def check_timeouts(db_path, now):
-    """看门狗：在途任务的设备超过 offline_grace_sec 没有任何消息 → 判离线。
+def _open_offline_alert(conn, ship, now, note):
+    """开一张 OFFLINE 告警单：定级、指派升级链第一位负责人并通知。调用方需已持有事务。"""
+    chain = _chain_of(ship)
+    assignee = chain[0] if chain else None
+    cur = conn.execute(
+        "INSERT INTO alerts(shipment_id, device_id, type, severity, assignee,"
+        " assignee_idx, assignee_since, opened_at, first_ts, last_ts, detail)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (ship["id"], ship["device_id"], "OFFLINE", OFFLINE_SEVERITY, assignee, 0,
+         now if assignee else None, now, now, now, note),
+    )
+    _add_event(conn, cur.lastrowid, "OPENED", "system",
+               note + f"，定级 {OFFLINE_SEVERITY}·{SEVERITY_LABELS[OFFLINE_SEVERITY]}"
+               + (f"，负责人 {assignee}" if assignee else ""), now)
+    _maybe_notify(conn, cur.lastrowid, now)
+    return cur.lastrowid
 
-    MQTT 的 LWT 能覆盖大部分掉线；看门狗兜底 LWT 丢失（如服务端重启期间）的情况。
+
+def check_timeouts(db_path, now):
+    """看门狗，覆盖两类离线判定：
+
+    1. 在途任务的设备超过 offline_grace_sec 没有任何消息 → 判离线
+       （MQTT 的 LWT 能覆盖大部分掉线；这里兜底 LWT 丢失、服务端重启等场景）；
+    2. 新任务继承离线状态：任务创建时设备就已经离线（上一趟结束时掉线未恢复）
+       或从未上线，等不到“在线→离线”跳变 → 宽限期后为该任务补开 OFFLINE 告警；
+       该任务已有未关闭离线单则跳过，重复检查不重复开单。
     """
     with dbmod.connect(db_path) as conn:
         rows = conn.execute(
@@ -325,9 +336,53 @@ def check_timeouts(db_path, now):
             " JOIN shipments s ON s.device_id = ds.device_id AND s.status='IN_TRANSIT'"
             " WHERE ds.online=1"
         ).fetchall()
+        pending = conn.execute(
+            "SELECT s.id, s.created_at, s.offline_grace_sec, ds.online FROM shipments s"
+            " LEFT JOIN device_state ds ON ds.device_id = s.device_id"
+            " WHERE s.status='IN_TRANSIT'"
+        ).fetchall()
     for r in rows:
         if r["last_seen"] is not None and now - r["last_seen"] > r["offline_grace_sec"]:
             set_device_online(db_path, r["device_id"], False, now, source="watchdog")
+    for r in pending:
+        if r["online"]:
+            continue  # 设备在线（含从未见过设备时的 NULL → 按离线处理）
+        if now - r["created_at"] > r["offline_grace_sec"]:
+            _inherit_offline_alert(db_path, r["id"], now)
+
+
+def _inherit_offline_alert(db_path, shipment_id, now):
+    """为在途任务补开 OFFLINE 告警（任务开始时设备已离线/从未上线，宽限期后仍未恢复）。
+
+    幂等：该任务已有未关闭的离线单则直接返回；设备在宽限期内恢复在线也不开单。
+    """
+    with dbmod.connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ship = conn.execute(
+            "SELECT * FROM shipments WHERE id=? AND status='IN_TRANSIT'", (shipment_id,)
+        ).fetchone()
+        if not ship:
+            return
+        ds = conn.execute(
+            "SELECT * FROM device_state WHERE device_id=?", (ship["device_id"],)
+        ).fetchone()
+        if ds and ds["online"]:
+            return  # 设备已恢复在线
+        if now - ship["created_at"] <= ship["offline_grace_sec"]:
+            return  # 仍在宽限期内
+        dup = conn.execute(
+            f"SELECT id FROM alerts WHERE shipment_id=? AND type='OFFLINE'"
+            f" AND status IN ({','.join('?' * len(OPEN_STATUSES))})",
+            (shipment_id, *OPEN_STATUSES),
+        ).fetchone()
+        if dup:
+            return  # 重复检查不重复开单
+        if ds is None:
+            note = f"设备从未上线，超过宽限 {ship['offline_grace_sec']}s 未收到任何数据（watchdog-inherit）"
+        else:
+            note = f"任务开始时设备已离线，宽限 {ship['offline_grace_sec']}s 后仍未恢复（watchdog-inherit）"
+        _open_offline_alert(conn, ship, now, note=note)
+        conn.commit()
 
 
 def check_escalations(db_path, now):

@@ -342,6 +342,87 @@ class TestOfflineRecoveryApi(CoreTestBase):
         self.assertEqual(temp_actions, ["OPENED"])
 
 
+class TestOfflineInheritance(CoreTestBase):
+    """上一趟结束时设备已离线：新任务继承离线状态，宽限期后告警，重复检查不重复开单。"""
+
+    def end_trip_offline(self):
+        """上一趟运输途中掉线，任务结束时设备仍未恢复；返回新创建的下一趟任务。"""
+        core.set_device_online(self.db, "dev-1", True, now=1001.0)
+        core.set_device_online(self.db, "dev-1", False, now=1002.0)  # 老任务的 OFFLINE 单
+        core.complete_shipment(self.db, self.sid, now=1003.0)
+        # 设备一直离线……
+        return core.create_shipment(self.db, "下一趟", "dev-1", 2.0, 8.0, 5.0, now=1010.0)
+
+    def offline_alerts(self, shipment_id):
+        return [a for a in core.list_alerts(self.db, shipment_id=shipment_id)
+                if a["type"] == "OFFLINE"]
+
+    def test_new_shipment_inherits_offline_after_grace(self):
+        ship2 = self.end_trip_offline()
+
+        core.check_timeouts(self.db, now=1014.0)  # 宽限期内：不开单
+        self.assertEqual(self.offline_alerts(ship2["id"]), [])
+
+        core.check_timeouts(self.db, now=1016.0)  # 宽限期后：继承离线状态开单
+        offs = self.offline_alerts(ship2["id"])
+        self.assertEqual(len(offs), 1)
+        self.assertEqual(offs[0]["status"], "OPEN")
+
+        core.check_timeouts(self.db, now=1017.0)  # 重复检查不重复开单
+        core.check_timeouts(self.db, now=1018.0)
+        self.assertEqual(len(self.offline_alerts(ship2["id"])), 1)
+
+    def test_recovery_auto_resolves_inherited_alert(self):
+        ship2 = self.end_trip_offline()
+        core.check_timeouts(self.db, now=1016.0)
+        off2 = self.offline_alerts(ship2["id"])[0]
+        old_off = self.offline_alerts(self.sid)[0]  # 老任务那张还开着
+
+        core.set_device_online(self.db, "dev-1", True, now=1020.0, source="mqtt-status")
+        for off in (off2, old_off):  # 新老两张离线单都自动关闭并留恢复记录
+            a = core.get_alert(self.db, off["id"])
+            self.assertEqual(a["status"], "RESOLVED")
+            self.assertTrue(any(e["action"] == "AUTO_RESOLVED" for e in a["events"]))
+
+        # 新任务的时间线能看到完整状态变化：开单 → 自动恢复
+        tl = core.get_timeline(self.db, ship2["id"])
+        actions = [it["action"] for it in tl["items"] if it["kind"] == "alert_event"]
+        self.assertEqual(actions, ["OPENED", "AUTO_RESOLVED"])
+
+    def test_never_seen_device_alerts_after_grace(self):
+        core.complete_shipment(self.db, self.sid, now=1000.0)
+        ship2 = core.create_shipment(self.db, "新车首趟", "dev-2", 2.0, 8.0, 5.0, now=1000.0)
+        core.check_timeouts(self.db, now=1004.0)  # 宽限期内
+        self.assertEqual(self.offline_alerts(ship2["id"]), [])
+        core.check_timeouts(self.db, now=1006.0)  # 设备从未上线，宽限期后告警
+        offs = self.offline_alerts(ship2["id"])
+        self.assertEqual(len(offs), 1)
+        core.set_device_online(self.db, "dev-2", True, now=1008.0)  # 设备终于上线
+        self.assertEqual(core.get_alert(self.db, offs[0]["id"])["status"], "RESOLVED")
+
+    def test_recovery_within_grace_no_alert(self):
+        ship2 = self.end_trip_offline()
+        core.set_device_online(self.db, "dev-1", True, now=1013.0)  # 宽限期内恢复
+        core.check_timeouts(self.db, now=1016.0)  # 距恢复仅 3s，未超宽限
+        self.assertEqual(core.list_alerts(self.db, shipment_id=ship2["id"]), [])
+        # 设备持续有数据，之后也不会被误判离线
+        self.send("hb-1", 5.0, 1018.0, now=1018.0)
+        core.check_timeouts(self.db, now=1020.0)
+        self.assertEqual(core.list_alerts(self.db, shipment_id=ship2["id"]), [])
+
+    def test_inherited_alert_has_assignee_and_escalates(self):
+        core.complete_shipment(self.db, self.sid, now=1000.0)
+        ship2 = core.create_shipment(self.db, "专车", "dev-2", 2.0, 8.0, 5.0, now=1000.0,
+                                     escalation_chain=["调度-A", "主管-B"], escalate_after_sec=10.0)
+        core.check_timeouts(self.db, now=1006.0)
+        off = self.offline_alerts(ship2["id"])[0]
+        self.assertEqual(off["assignee"], "调度-A")
+        self.assertTrue(any(e["action"] == "NOTIFY"
+                            for e in core.get_alert(self.db, off["id"])["events"]))
+        core.check_escalations(self.db, now=1017.0)  # 继承的离线单同样走升级链
+        self.assertEqual(core.get_alert(self.db, off["id"])["assignee"], "主管-B")
+
+
 class ChainTestBase(CoreTestBase):
     """另建一个带负责人升级链的任务（dev-2）：链 调度-A → 主管-B → 总监-C，10s 未处理完升级。"""
 
