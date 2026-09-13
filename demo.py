@@ -1,9 +1,9 @@
 """一键演示：起 broker + 服务端 + 设备模拟器，跑一趟带完整异常的冷链运输。
 
 场景：正常运输 → 超温告警（按偏差/持续分级 L1→L2，超时未处理沿负责人链自动升级，
-同级通知不重复）→ 处理关闭 → 断网（离线告警、本地缓存）→ 恢复（补传不丢、自动关
-离线单、断网期间的严重超温开新单）→ 重复消息去重 → 迟到数据并入已关闭告警
-（不重开、不重新升级）→ 完成任务，输出完整异常时间线。
+同级通知不重复）→ 处理关闭 → 断网（离线告警、本地缓存）→ 恢复（补传不丢、离线单
+自动关闭留恢复记录、超温单不被顺手关掉、重复上线幂等）→ 断网期间的严重超温开新单
+→ 重复消息去重 → 迟到数据并入已关闭告警（不重开、不重新升级）→ 完成任务，输出完整异常时间线。
 
   python3 demo.py
 """
@@ -122,11 +122,23 @@ def main():
     log(f"⚠ 告警 #{a_off['id']} OFFLINE，级别 {a_off['severity']}，负责人 {a_off['assignee']}")
     time.sleep(2.5)
 
-    # 7. 恢复：补传不丢，离线单自动关闭，断网期间的超温开新单（偏差 ≥4℃ 直接定 L3）
+    # 7. 恢复：补传不丢，离线单自动关闭并留恢复记录，超温单不被顺手关掉
     sim.connect()
     log("📶 网络恢复，设备补传缓存数据 …")
     wait_for("离线告警自动关闭", lambda: api(f"/api/alerts/{a_off['id']}")["status"] == "RESOLVED")
-    log("离线告警已自动关闭（设备恢复在线）")
+    a_off_done = api(f"/api/alerts/{a_off['id']}")
+    assert any(e["action"] == "AUTO_RESOLVED" for e in a_off_done["events"])
+    log("离线告警已自动关闭（AUTO_RESOLVED 留痕），断网期间的超温单保持打开")
+
+    # 重复上线（retained 状态重投）：幂等，不产生重复恢复记录
+    n_events = len(a_off_done["events"])
+    sim.publish_status("online")
+    sim.publish_status("online")
+    time.sleep(1.0)
+    a_off_again = api(f"/api/alerts/{a_off['id']}")
+    assert a_off_again["status"] == "RESOLVED" and len(a_off_again["events"]) == n_events
+    log("重复上线 ×2：服务端幂等，离线单保持已关闭，无重复恢复记录 ✅")
+
     a2 = wait_for("断网期间超温开新单", lambda: next(
         (a for a in api(f"/api/alerts?shipment_id={sid}")
          if a["type"] == "TEMP_HIGH" and a["id"] != a1["id"]), None))

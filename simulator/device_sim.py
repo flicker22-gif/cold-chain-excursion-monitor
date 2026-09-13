@@ -123,6 +123,13 @@ class DeviceSim:
         if self._client and self.online:
             self._client.publish(self._topic("telemetry"), json.dumps(sample), qos=1)
 
+    def publish_status(self, state):
+        """补发一次在线状态（模拟 retained 重投/重复上线），服务端应幂等处理。"""
+        if self._client and self.online:
+            self._client.publish(self._topic("status"),
+                                 json.dumps({"state": state, "ts": time.time()}),
+                                 qos=1, retain=True)
+
     def send_raw(self, msg_id, temp, ts):
         """以指定 msg_id / 采样时刻补发一条（模拟迟到很久的补传数据）。"""
         if self._client and self.online:

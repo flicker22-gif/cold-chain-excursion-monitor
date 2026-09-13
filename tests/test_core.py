@@ -230,6 +230,118 @@ class TestBackfillOfflineConsistency(CoreTestBase):
         self.assertLessEqual(core.list_devices(self.db)[0]["last_seen"], 1005.0)
 
 
+class TestOfflineRecoveryCycle(CoreTestBase):
+    """断网 → 恢复 → 重复上线：离线告警自动结束并留恢复记录，超温告警不被顺手关掉。"""
+
+    def trip_offline(self, now):
+        core.set_device_online(self.db, "dev-1", False, now=now)
+        return next(a for a in core.list_alerts(self.db, status="open") if a["type"] == "OFFLINE")
+
+    def test_disconnect_recover_duplicate_online(self):
+        # 先制造一张未关闭的超温告警（设备随实时数据在线）
+        self.send("t1", 9.5, 990.0, now=990.0)
+        temp_alert = next(a for a in core.list_alerts(self.db, status="open")
+                          if a["type"] == "TEMP_HIGH")
+
+        # 断网：离线告警开单
+        off = self.trip_offline(1000.0)
+        self.assertEqual(off["status"], "OPEN")
+
+        # 恢复上线：离线告警自动结束 + 恢复记录；超温告警保持打开
+        core.set_device_online(self.db, "dev-1", True, now=1005.0, source="mqtt-status")
+        off_after = core.get_alert(self.db, off["id"])
+        self.assertEqual(off_after["status"], "RESOLVED")
+        self.assertEqual(off_after["resolved_at"], 1005.0)
+        auto = [e for e in off_after["events"] if e["action"] == "AUTO_RESOLVED"]
+        self.assertEqual(len(auto), 1)
+        self.assertIn("恢复在线", auto[0]["note"])  # 恢复记录留痕
+        temp_after = core.get_alert(self.db, temp_alert["id"])
+        self.assertEqual(temp_after["status"], "OPEN", "恢复在线不能顺手关掉超温告警")
+        self.assertFalse(any(e["action"] in ("RESOLVED", "AUTO_RESOLVED")
+                             for e in temp_after["events"]))
+
+        # 重复上线（retained 重投/重复上报）：幂等，不产生重复恢复记录
+        core.set_device_online(self.db, "dev-1", True, now=1006.0, source="mqtt-status")
+        core.set_device_online(self.db, "dev-1", True, now=1007.0, source="mqtt-status")
+        off_again = core.get_alert(self.db, off["id"])
+        self.assertEqual(off_again["status"], "RESOLVED")
+        self.assertEqual(len(off_again["events"]), len(off_after["events"]))
+        self.assertEqual(len(core.list_alerts(self.db)), 2)  # 没有新开单
+
+        # 接口视角：未关闭的只剩超温告警；设备在线
+        self.assertEqual([a["type"] for a in core.list_alerts(self.db, status="open")],
+                         ["TEMP_HIGH"])
+        self.assertEqual(core.list_devices(self.db)[0]["online"], 1)
+
+        # 时间线视角：离线单 OPENED → AUTO_RESOLVED；超温单只有 OPENED，无关闭类事件
+        tl = core.get_timeline(self.db, self.sid)
+        off_events = [it["action"] for it in tl["items"]
+                      if it["kind"] == "alert_event" and it["alert_id"] == off["id"]]
+        self.assertEqual(off_events, ["OPENED", "AUTO_RESOLVED"])
+        temp_events = [it["action"] for it in tl["items"]
+                       if it["kind"] == "alert_event" and it["alert_id"] == temp_alert["id"]]
+        self.assertEqual(temp_events, ["OPENED"])
+
+    def test_second_offline_cycle_opens_new_alert(self):
+        core.set_device_online(self.db, "dev-1", True, now=995.0)
+        off1 = self.trip_offline(1000.0)
+        core.set_device_online(self.db, "dev-1", True, now=1005.0)
+        off2 = self.trip_offline(1010.0)  # 第二次断网 → 新开一张离线单
+        self.assertNotEqual(off1["id"], off2["id"])
+        core.set_device_online(self.db, "dev-1", True, now=1015.0)
+        # 两张离线单各自独立关闭、各自留恢复记录
+        for off in (off1, off2):
+            a = core.get_alert(self.db, off["id"])
+            self.assertEqual(a["status"], "RESOLVED")
+            self.assertEqual([e["action"] for e in a["events"]], ["OPENED", "AUTO_RESOLVED"])
+
+
+class TestOfflineRecoveryApi(CoreTestBase):
+    """接口视角：断网/恢复/重复上线的状态变化在 API 与时间线上可见。"""
+
+    def setUp(self):
+        super().setUp()
+        from server import app as server_app
+        self.app_mod = server_app
+        self._old_db = server_app.DB_PATH
+        server_app.DB_PATH = self.db
+        self.client = server_app.app.test_client()
+
+    def tearDown(self):
+        self.app_mod.DB_PATH = self._old_db
+        super().tearDown()
+
+    def test_api_and_timeline_reflect_offline_recovery(self):
+        self.send("t1", 9.5, 990.0, now=990.0)  # 超温告警开着
+        core.set_device_online(self.db, "dev-1", False, now=1000.0)
+
+        # 断网后：API 能看到离线 + 超温两张未关闭单，设备离线
+        open_types = {a["type"] for a in self.client.get("/api/alerts?status=open").get_json()}
+        self.assertEqual(open_types, {"TEMP_HIGH", "OFFLINE"})
+        self.assertEqual(self.client.get("/api/devices").get_json()[0]["online"], 0)
+
+        # 恢复 + 重复上线
+        core.set_device_online(self.db, "dev-1", True, now=1005.0, source="mqtt-status")
+        core.set_device_online(self.db, "dev-1", True, now=1006.0, source="mqtt-status")
+
+        # API：未关闭的只剩超温单；设备在线；离线单已关闭且 resolved_at 是恢复时刻
+        open_types = {a["type"] for a in self.client.get("/api/alerts?status=open").get_json()}
+        self.assertEqual(open_types, {"TEMP_HIGH"})
+        self.assertEqual(self.client.get("/api/devices").get_json()[0]["online"], 1)
+        resolved = self.client.get("/api/alerts?status=RESOLVED").get_json()
+        off = next(a for a in resolved if a["type"] == "OFFLINE")
+        self.assertEqual(off["resolved_at"], 1005.0)
+
+        # 时间线：离线单 OPENED → AUTO_RESOLVED；超温单无任何关闭类事件
+        tl = self.client.get(f"/api/shipments/{self.sid}/timeline").get_json()
+        actions = [(it["alert_type"], it["action"]) for it in tl["items"]
+                   if it["kind"] == "alert_event"]
+        self.assertIn(("OFFLINE", "OPENED"), actions)
+        self.assertIn(("OFFLINE", "AUTO_RESOLVED"), actions)
+        temp_actions = [a for t, a in actions if t == "TEMP_HIGH"]
+        self.assertEqual(temp_actions, ["OPENED"])
+
+
 class ChainTestBase(CoreTestBase):
     """另建一个带负责人升级链的任务（dev-2）：链 调度-A → 主管-B → 总监-C，10s 未处理完升级。"""
 
