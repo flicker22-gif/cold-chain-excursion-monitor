@@ -1,4 +1,5 @@
-"""核心业务逻辑：温度判定、告警分级与生命周期、超时自动升级、去重、迟到数据合并、离线看门狗。
+"""核心业务逻辑：温度判定、告警分级与生命周期、超时自动升级、去重、迟到数据合并、
+跨任务补传归属、离线看门狗。
 
 所有函数接收显式的 `now`（epoch 秒），单测可以注入确定性时间。
 每个函数自开自关事务（BEGIN IMMEDIATE），MQTT 线程 / HTTP 线程 / 看门狗线程并发安全。
@@ -92,33 +93,66 @@ def list_shipments(db_path):
 
 # ---------------------------------------------------------------- 温度数据接入
 
+def _find_shipment_for_ts(conn, device_id, device_ts):
+    """按设备采样时刻归属任务：窗口 [created_at, finished_at]（在途任务视为 +∞）。
+
+    断网横跨两趟任务时，恢复后补传的缓存样本按各自窗口分别落窗——
+    哪怕那趟已经完成，也归当时那趟运输，而不是当前在途的任务。
+    """
+    return conn.execute(
+        "SELECT * FROM shipments WHERE device_id=? AND created_at<=?"
+        " AND (finished_at IS NULL OR finished_at>=?) ORDER BY id DESC LIMIT 1",
+        (device_id, device_ts, device_ts),
+    ).fetchone()
+
+
 def ingest_telemetry(db_path, device_id, msg_id, seq, temp, device_ts, now):
     """接入一条温度数据。
 
-    - 按 (device_id, msg_id) 唯一约束去重：重复消息/补报重发不会重复入库、重复报警；
-    - 仅实时样本（到达时刻≈采样时刻）更新设备在线状态：置在线并自动关闭挂着的离线告警；
-      断网补传的历史样本不碰在线状态/心跳——它证明不了链路此刻已恢复；
-    - 越限时：有未关闭告警则并入（延长窗口、刷峰值），不新建；
-      最近的同类告警已 RESOLVED 且样本落在其异常窗口内 → 记 LATE_DATA，绝不开新单；
-      否则是真正的新一次异常，开新告警。
+    归属规则（按设备采样时刻 device_ts 落窗）：
+    - 采样时刻落在某趟任务的窗口内 → 归该趟，哪怕它已经完成；
+    - 实时样本（到达≈采样）兜底归在途任务，容忍设备时钟轻微偏差；
+    - 哪个窗口都不在（两趟之间的空档、任务开始前/结束后）→ 孤儿样本：
+      去重后留存（shipment_id=NULL），可查，绝不开告警。
+
+    处理规则：
+    - 按 (device_id, msg_id) 唯一约束去重：重复消息/补报重发只算一次；
+    - 在途任务：仅实时样本更新设备在线状态（补传的历史样本证明不了链路已恢复）；
+      越限时：有未关闭告警则并入，落在已关闭告警窗口内则记 LATE_DATA 留痕，
+      否则开新告警；
+    - 已完成任务：只修正统计与时间线——越限样本落在某张告警窗口内则并入该单
+      并记 LATE_DATA（状态/级别/负责人/通知记录全部冻结），窗口外只留样本本身，
+      绝不开新单、绝不改级别、绝不换负责人。
     """
     with dbmod.connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        ship = conn.execute(
-            "SELECT * FROM shipments WHERE device_id=? AND status='IN_TRANSIT' ORDER BY id DESC LIMIT 1",
-            (device_id,),
-        ).fetchone()
-        if not ship:
-            return {"accepted": False, "reason": "no_active_shipment"}
-
         backfilled = 1 if now - device_ts > BACKFILL_AGE_SEC else 0
+        ship = _find_shipment_for_ts(conn, device_id, device_ts)
+        if ship is None and not backfilled:
+            ship = conn.execute(
+                "SELECT * FROM shipments WHERE device_id=? AND status='IN_TRANSIT'"
+                " ORDER BY id DESC LIMIT 1",
+                (device_id,),
+            ).fetchone()
+        if ship is None:
+            # 孤儿样本：采样时刻不在任何任务窗口内。按明确规则留存，随时可查。
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO telemetry"
+                " (device_id, shipment_id, msg_id, seq, temp, device_ts, arrived_at, backfilled)"
+                " VALUES (?,NULL,?,?,?,?,?,?)",
+                (device_id, msg_id, seq, temp, device_ts, now, backfilled),
+            )
+            conn.commit()
+            return {"accepted": True, "duplicated": cur.rowcount == 0,
+                    "orphan": True, "backfilled": bool(backfilled)}
+
         cur = conn.execute(
             "INSERT OR IGNORE INTO telemetry"
             " (device_id, shipment_id, msg_id, seq, temp, device_ts, arrived_at, backfilled)"
             " VALUES (?,?,?,?,?,?,?,?)",
             (device_id, ship["id"], msg_id, seq, temp, device_ts, now, backfilled),
         )
-        if not backfilled:
+        if not backfilled and ship["status"] == "IN_TRANSIT":
             # 只有实时样本能证明链路此刻是通的：置在线并顺带关闭挂着的离线告警。
             # 断网补传的是历史样本，不碰在线状态/心跳，避免“设备在线、离线单却开着”的状态翻转。
             _mark_online(conn, device_id, now, source="telemetry")
@@ -126,7 +160,15 @@ def ingest_telemetry(db_path, device_id, msg_id, seq, temp, device_ts, now):
             conn.commit()
             return {"accepted": True, "duplicated": True}
 
-        result = {"accepted": True, "duplicated": False, "backfilled": bool(backfilled)}
+        result = {"accepted": True, "duplicated": False, "backfilled": bool(backfilled),
+                  "shipment_id": ship["id"]}
+        if ship["status"] == "COMPLETED":
+            # 已完成任务：补传样本只能修正统计和时间线
+            result["shipment_completed"] = True
+            if temp > ship["temp_max"] or temp < ship["temp_min"]:
+                result["alert"] = _merge_late_into_completed(conn, ship, temp, device_ts, now)
+            conn.commit()
+            return result
         if temp > ship["temp_max"]:
             result["alert"] = _on_violation(conn, ship, "TEMP_HIGH", temp, device_ts, now)
         elif temp < ship["temp_min"]:
@@ -135,6 +177,26 @@ def ingest_telemetry(db_path, device_id, msg_id, seq, temp, device_ts, now):
             _maybe_recovered(conn, ship, temp, device_ts, now)
         conn.commit()
         return result
+
+
+def _merge_late_into_completed(conn, ship, temp, ts, now):
+    """已完成任务上的越限补传：落在某张告警窗口内 → 修正统计并记 LATE_DATA 留痕；
+    窗口外 → 只留样本（时间线可见）。绝不开新单，状态/级别/负责人/通知记录全部冻结。"""
+    alert_type = "TEMP_HIGH" if temp > ship["temp_max"] else "TEMP_LOW"
+    a = conn.execute(
+        "SELECT * FROM alerts WHERE shipment_id=? AND type=? AND first_ts<=? AND last_ts>=?"
+        " ORDER BY id DESC LIMIT 1",
+        (ship["id"], alert_type, ts, ts),
+    ).fetchone()
+    if not a:
+        return None  # 样本已留存，时间线里仍能看到这条越限
+    _merge_into_alert(conn, a, temp, ts)
+    _add_event(
+        conn, a["id"], "LATE_DATA", "system",
+        f"任务完成后补传（temp={temp}℃, device_ts={ts:.3f}）：仅修正统计，"
+        f"状态/级别/负责人冻结", now,
+    )
+    return {"alert_id": a["id"], "late": True, "shipment_completed": True}
 
 
 def _on_violation(conn, ship, alert_type, temp, ts, now):
@@ -562,45 +624,95 @@ def _add_event(conn, alert_id, action, actor, note, now):
 
 # ---------------------------------------------------------------- 时间线
 
+def list_orphan_telemetry(db_path, device_id=None):
+    """孤儿样本：到达时采样时刻不在任何任务窗口内（两趟之间的空档、任务开始前/
+    结束后的补传）。按明确规则留存（shipment_id=NULL），随时可查。"""
+    sql, args = "SELECT * FROM telemetry WHERE shipment_id IS NULL", []
+    if device_id:
+        sql += " AND device_id=?"
+        args.append(device_id)
+    sql += " ORDER BY device_ts"
+    with dbmod.connect(db_path) as conn:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+
+def _shipment_timeline_items(conn, ship):
+    """一趟任务的时间线条目：任务节点、告警事件、越限样本（含补传/完成后补传标记）。"""
+    items = [{
+        "ts": ship["created_at"], "kind": "shipment", "shipment_id": ship["id"],
+        "text": f"任务创建：{ship['name']}（{ship['device_id']}，阈值 "
+                f"{ship['temp_min']}~{ship['temp_max']}℃）",
+    }]
+    if ship["finished_at"]:
+        items.append({"ts": ship["finished_at"], "kind": "shipment",
+                      "shipment_id": ship["id"], "text": "任务完成"})
+
+    alerts = conn.execute(
+        "SELECT * FROM alerts WHERE shipment_id=? ORDER BY id", (ship["id"],)
+    ).fetchall()
+    for a in alerts:
+        events = conn.execute(
+            "SELECT * FROM alert_events WHERE alert_id=? ORDER BY id", (a["id"],)
+        ).fetchall()
+        for e in events:
+            items.append({
+                "ts": e["created_at"], "kind": "alert_event", "shipment_id": ship["id"],
+                "alert_id": a["id"], "alert_type": a["type"], "action": e["action"],
+                "actor": e["actor"], "text": e["note"],
+            })
+
+    violations = conn.execute(
+        "SELECT * FROM telemetry WHERE shipment_id=? AND (temp<? OR temp>?) ORDER BY device_ts",
+        (ship["id"], ship["temp_min"], ship["temp_max"]),
+    ).fetchall()
+    for v in violations:
+        note = ""
+        if v["backfilled"]:
+            note = "（断网补传）"
+            if ship["finished_at"] and v["arrived_at"] > ship["finished_at"]:
+                note = "（任务完成后补传，仅修正统计）"
+        items.append({
+            "ts": v["device_ts"], "kind": "violation", "shipment_id": ship["id"],
+            "text": f"越限样本 {v['temp']}℃" + note,
+            "temp": v["temp"], "backfilled": bool(v["backfilled"]),
+            "arrived_at": v["arrived_at"],
+        })
+    return items
+
+
 def get_timeline(db_path, shipment_id):
     """一次运输的完整时间线：任务节点、越限样本、告警开单/处理/关闭，按时间排序。"""
     with dbmod.connect(db_path) as conn:
         ship = conn.execute("SELECT * FROM shipments WHERE id=?", (shipment_id,)).fetchone()
         if not ship:
             return None
-        items = [{
-            "ts": ship["created_at"], "kind": "shipment",
-            "text": f"任务创建：{ship['name']}（{ship['device_id']}，阈值 "
-                    f"{ship['temp_min']}~{ship['temp_max']}℃）",
-        }]
-        if ship["finished_at"]:
-            items.append({"ts": ship["finished_at"], "kind": "shipment", "text": "任务完成"})
-
-        alerts = conn.execute(
-            "SELECT * FROM alerts WHERE shipment_id=? ORDER BY id", (shipment_id,)
-        ).fetchall()
-        for a in alerts:
-            events = conn.execute(
-                "SELECT * FROM alert_events WHERE alert_id=? ORDER BY id", (a["id"],)
-            ).fetchall()
-            for e in events:
-                items.append({
-                    "ts": e["created_at"], "kind": "alert_event",
-                    "alert_id": a["id"], "alert_type": a["type"], "action": e["action"],
-                    "actor": e["actor"], "text": e["note"],
-                })
-
-        violations = conn.execute(
-            "SELECT * FROM telemetry WHERE shipment_id=? AND (temp<? OR temp>?) ORDER BY device_ts",
-            (shipment_id, ship["temp_min"], ship["temp_max"]),
-        ).fetchall()
-        for v in violations:
-            items.append({
-                "ts": v["device_ts"], "kind": "violation",
-                "text": f"越限样本 {v['temp']}℃"
-                        + ("（断网补传）" if v["backfilled"] else ""),
-                "temp": v["temp"], "backfilled": bool(v["backfilled"]),
-            })
-
+        items = _shipment_timeline_items(conn, ship)
         items.sort(key=lambda x: (x["ts"], 0 if x["kind"] == "shipment" else 1))
         return {"shipment": dict(ship), "items": items}
+
+
+def get_device_timeline(db_path, device_id):
+    """设备视角的跨任务完整时间线：各趟任务节点、告警事件、越限样本（含补传标记），
+    加上无任务窗口的孤儿样本，按时间合并排序——一段断网横跨几趟任务的补传全程可见。"""
+    with dbmod.connect(db_path) as conn:
+        ships = conn.execute(
+            "SELECT * FROM shipments WHERE device_id=? ORDER BY created_at, id", (device_id,)
+        ).fetchall()
+        items = []
+        for ship in ships:
+            items.extend(_shipment_timeline_items(conn, ship))
+        orphans = conn.execute(
+            "SELECT * FROM telemetry WHERE device_id=? AND shipment_id IS NULL"
+            " ORDER BY device_ts",
+            (device_id,),
+        ).fetchall()
+        for o in orphans:
+            items.append({
+                "ts": o["device_ts"], "kind": "orphan", "shipment_id": None,
+                "text": f"孤儿样本 {o['temp']}℃（采样时刻不在任何任务窗口内，已留存可查）",
+                "temp": o["temp"], "backfilled": bool(o["backfilled"]),
+                "arrived_at": o["arrived_at"],
+            })
+        items.sort(key=lambda x: (x["ts"], 0 if x["kind"] == "shipment" else 1))
+        return {"device_id": device_id,
+                "shipments": [s["id"] for s in ships], "items": items}

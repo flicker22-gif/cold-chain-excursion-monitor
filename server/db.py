@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS shipments (
 CREATE TABLE IF NOT EXISTS telemetry (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   device_id   TEXT NOT NULL,
-  shipment_id INTEGER NOT NULL,
+  shipment_id INTEGER,                -- NULL = 采样时刻不在任何任务窗口内的孤儿样本（留存可查）
   msg_id      TEXT NOT NULL,          -- 设备侧唯一消息号，去重靠它
   seq         INTEGER,
   temp        REAL NOT NULL,
@@ -95,3 +95,28 @@ def init_db(db_path):
             cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
             if col not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+        _migrate_telemetry_nullable_shipment(conn)
+
+
+def _migrate_telemetry_nullable_shipment(conn):
+    """telemetry.shipment_id 改为可空：无对应任务窗口的样本按孤儿留存（NULL）。
+    SQLite 不能放宽列约束，老库整表重建；新库由 SCHEMA 直接建好。"""
+    info = {r["name"]: r for r in conn.execute("PRAGMA table_info(telemetry)")}
+    if info and info["shipment_id"]["notnull"]:
+        conn.executescript("""
+        ALTER TABLE telemetry RENAME TO telemetry_old;
+        CREATE TABLE telemetry (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          device_id   TEXT NOT NULL,
+          shipment_id INTEGER,
+          msg_id      TEXT NOT NULL,
+          seq         INTEGER,
+          temp        REAL NOT NULL,
+          device_ts   REAL NOT NULL,
+          arrived_at  REAL NOT NULL,
+          backfilled  INTEGER NOT NULL DEFAULT 0,
+          UNIQUE (device_id, msg_id)
+        );
+        INSERT INTO telemetry SELECT * FROM telemetry_old;
+        DROP TABLE telemetry_old;
+        """)

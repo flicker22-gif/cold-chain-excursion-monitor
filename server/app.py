@@ -108,6 +108,19 @@ def devices():
     return jsonify(core.list_devices(DB_PATH))
 
 
+@app.get("/api/devices/<device_id>/timeline")
+def device_timeline(device_id):
+    """设备视角的跨任务完整时间线（含孤儿样本）。"""
+    return jsonify(core.get_device_timeline(DB_PATH, device_id))
+
+
+@app.get("/api/telemetry/orphans")
+def orphan_telemetry():
+    """无任务窗口的留存样本（两趟之间的空档等）。"""
+    return jsonify(core.list_orphan_telemetry(
+        DB_PATH, device_id=request.args.get("device_id")))
+
+
 # ---------------------------------------------------------------- 看板页面
 
 @app.get("/")
@@ -132,6 +145,7 @@ _DASHBOARD_HTML = """<!doctype html>
  .tl{border-left:3px solid #ddd;margin:6px 0 6px 4px;padding-left:12px}
  .tl div{margin:5px 0}.tl .t{color:#888;font-size:12px;margin-right:8px}
  .k-shipment{border-color:#1677ff}.k-alert_event{border-color:#fa8c16}.k-violation{border-color:#cf1322}
+ .k-orphan{border-color:#8c8c8c;border-style:dashed}
  select,input{padding:4px 6px}
 </style></head><body>
 <h1>🚚 冷链运输温度监控</h1>
@@ -150,6 +164,8 @@ _DASHBOARD_HTML = """<!doctype html>
 <h2>告警（<a href="javascript:load()">刷新</a>）</h2><div id="alerts"></div>
 <h2>异常时间线 <select id="tlship" onchange="loadTimeline()"></select></h2>
 <div id="timeline" class="card"></div>
+<h2>设备时间线（跨任务·含孤儿样本） <select id="tldev" onchange="loadDevTimeline()"></select></h2>
+<div id="devtimeline" class="card"></div>
 <script>
 const fmt = ts => new Date(ts*1000).toLocaleTimeString('zh-CN',{hour12:false}) +
   '.' + String(Math.round(ts*1000)%1000).padStart(3,'0');
@@ -206,7 +222,21 @@ async function loadTimeline(){
     return `<div class="tl k-${i.kind}"><div><span class="t">${fmt(i.ts)}</span>${head}${i.text||''}</div></div>`;
   }).join('') || '<i>暂无事件</i>';
 }
-load(); setInterval(load, 5000);
+async function loadDevTimeline(){
+  const devs = await api('/api/devices');
+  const sel = document.getElementById('tldev');
+  if(sel.options.length !== devs.length)
+    sel.innerHTML = devs.map(d=>`<option value="${d.device_id}">${d.device_id}</option>`).join('');
+  const id = sel.value;
+  if(!id){ document.getElementById('devtimeline').innerHTML=''; return; }
+  const t = await api(`/api/devices/${id}/timeline`);
+  document.getElementById('devtimeline').innerHTML = t.items.map(i=>{
+    const head = i.kind==='alert_event' ? `[告警#${i.alert_id} ${i.alert_type}·${i.action}${i.actor?'·'+i.actor:''}] ` : '';
+    const tag = i.shipment_id ? `#${i.shipment_id}` : '无任务';
+    return `<div class="tl k-${i.kind}"><div><span class="t">${fmt(i.ts)}</span>[${tag}] ${head}${i.text||''}</div></div>`;
+  }).join('') || '<i>暂无事件</i>';
+}
+load(); loadDevTimeline(); setInterval(()=>{load(); loadDevTimeline();}, 5000);
 </script></body></html>"""
 
 

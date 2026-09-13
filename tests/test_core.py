@@ -645,10 +645,17 @@ class TestShipment(CoreTestBase):
         again = core.create_shipment(self.db, "重复创建", "dev-1", 2.0, 8.0, 5.0, now=1001.0)
         self.assertEqual(again["id"], self.sid)
 
-    def test_telemetry_rejected_without_active_shipment(self):
+    def test_telemetry_without_matching_window_kept_as_orphan(self):
         core.complete_shipment(self.db, self.sid, now=2000.0)
-        r = self.send("m1", 9.5, 2001.0)
-        self.assertFalse(r["accepted"])
+        r = self.send("m1", 9.5, 2001.0)  # 采样时刻不在任何任务窗口内 → 孤儿留存
+        self.assertTrue(r["accepted"])
+        self.assertTrue(r["orphan"])
+        orphans = core.list_orphan_telemetry(self.db, "dev-1")
+        self.assertEqual(len(orphans), 1)
+        self.assertIsNone(orphans[0]["shipment_id"])
+        r2 = self.send("m1", 9.5, 2001.0)  # 重复补传仍只算一次
+        self.assertTrue(r2["duplicated"])
+        self.assertEqual(len(core.list_orphan_telemetry(self.db, "dev-1")), 1)
 
     def test_timeline_contains_key_events(self):
         self.send("m1", 9.5, 1001.0)
