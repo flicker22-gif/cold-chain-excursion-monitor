@@ -669,5 +669,157 @@ class TestShipment(CoreTestBase):
         self.assertIn("alert_event", kinds)
 
 
+class TestCrossShipmentBackfill(CoreTestBase):
+    """断网缓存的样本在任务完成后才补传：按采样时刻落窗归属，各归各趟。"""
+
+    def test_backfill_split_across_two_shipments_and_gap(self):
+        # 第一趟 [1000, 2000] 已完成，第二趟从 3000 开始在途
+        core.complete_shipment(self.db, self.sid, now=2000.0)
+        ship2 = core.create_shipment(self.db, "第二趟", "dev-1", 2.0, 8.0, 5.0, now=3000.0)
+
+        # 网络恢复，断网期间缓存的样本一次性补传（now=4000）
+        r1 = self.send("b1", 9.5, 1500.0, now=4000.0)   # 落在第一趟窗口（已完成）
+        r2 = self.send("b2", 9.6, 2500.0, now=4000.0)   # 两趟之间空档 → 孤儿
+        r3 = self.send("b3", 9.7, 3500.0, now=4000.0)   # 落在第二趟窗口（在途）
+
+        self.assertEqual(r1["shipment_id"], self.sid)
+        self.assertTrue(r1["shipment_completed"])
+        self.assertTrue(r2["orphan"])
+        self.assertEqual(r3["shipment_id"], ship2["id"])
+        self.assertFalse(r3.get("shipment_completed", False))
+
+        # 已完成任务上的越限补传：不开新告警；在途任务上的：正常开单
+        self.assertEqual(core.list_alerts(self.db, shipment_id=self.sid), [])
+        alerts2 = core.list_alerts(self.db, shipment_id=ship2["id"])
+        self.assertEqual(len(alerts2), 1)
+        self.assertEqual(alerts2[0]["type"], "TEMP_HIGH")
+
+        # 孤儿样本留存可查；三段时间的样本各自落窗
+        orphans = core.list_orphan_telemetry(self.db, "dev-1")
+        self.assertEqual([o["msg_id"] for o in orphans], ["b2"])
+        with dbmod.connect(self.db) as conn:
+            rows = conn.execute("SELECT msg_id, shipment_id FROM telemetry").fetchall()
+        got = {r["msg_id"]: r["shipment_id"] for r in rows}
+        self.assertEqual(got, {"b1": self.sid, "b2": None, "b3": ship2["id"]})
+
+    def test_completed_shipment_backfill_only_fixes_stats(self):
+        # 第一趟在途时越限开单并处理关闭，随后任务完成
+        self.send("m1", 9.0, 1100.0)
+        self.send("m2", 9.2, 1200.0)
+        a = core.list_alerts(self.db)[0]
+        core.transition_alert(self.db, a["id"], "resolve", "op", "处理完", now=1300.0)
+        core.complete_shipment(self.db, self.sid, now=2000.0)
+        before = core.get_alert(self.db, a["id"])
+
+        # 任务完成后补传：落在已关闭告警窗口内，温度极端（若重算级别会到 L3）
+        r = self.send("late-1", 15.0, 1150.0, now=5000.0)
+        self.assertTrue(r["shipment_completed"])
+        self.assertTrue(r["alert"]["late"])
+        after = core.get_alert(self.db, a["id"])
+        self.assertEqual(after["status"], "RESOLVED")
+        self.assertEqual(after["peak_temp"], 15.0)               # 统计被修正
+        self.assertEqual(after["severity"], before["severity"])  # 级别冻结
+        self.assertEqual(after["assignee"], before["assignee"])  # 负责人冻结
+        new_actions = [e["action"] for e in after["events"][len(before["events"]):]]
+        self.assertEqual(new_actions, ["LATE_DATA"])             # 只留痕
+
+        # 窗口外的越限补传：不开新单，但样本留存、时间线可见
+        r = self.send("late-2", 12.0, 1600.0, now=5000.0)
+        self.assertIsNone(r["alert"])
+        self.assertEqual(len(core.list_alerts(self.db, shipment_id=self.sid)), 1)
+        tl = core.get_timeline(self.db, self.sid)
+        v = [i for i in tl["items"] if i["kind"] == "violation" and i["ts"] == 1600.0]
+        self.assertEqual(len(v), 1)
+        self.assertTrue(v[0]["backfilled"])
+        self.assertIn("任务完成后补传", v[0]["text"])
+
+    def test_completed_shipment_backfill_never_regrades_or_reassigns(self):
+        # 带负责人升级链的任务：补传不能改级别、不能换负责人、不能触发新通知
+        ship = core.create_shipment(self.db, "专车", "dev-9", 2.0, 8.0, 5.0, now=1000.0,
+                                    escalation_chain=["调度-A", "主管-B"], escalate_after_sec=10.0)
+        core.ingest_telemetry(self.db, "dev-9", "m1", None, 9.0, 1100.0, now=1100.0)
+        core.ingest_telemetry(self.db, "dev-9", "m2", None, 9.2, 1200.0, now=1200.0)
+        a = core.list_alerts(self.db, shipment_id=ship["id"])[0]
+        self.assertEqual((a["severity"], a["assignee"]), ("L1", "调度-A"))
+        core.transition_alert(self.db, a["id"], "resolve", "主管-B", "处理完", now=1300.0)
+        core.complete_shipment(self.db, ship["id"], now=2000.0)
+        before = core.get_alert(self.db, a["id"])
+        n_notify = len([e for e in before["events"] if e["action"] == "NOTIFY"])
+
+        r = core.ingest_telemetry(self.db, "dev-9", "late-1", None, 15.0, 1150.0, now=5000.0)
+        self.assertTrue(r["alert"]["late"])
+        core.check_escalations(self.db, now=9000.0)  # 已完成任务不参与自动升级
+        after = core.get_alert(self.db, a["id"])
+        self.assertEqual(after["status"], "RESOLVED")
+        self.assertEqual(after["peak_temp"], 15.0)
+        self.assertEqual(after["severity"], before["severity"])
+        self.assertEqual(after["assignee"], before["assignee"])
+        notifies = [e for e in after["events"] if e["action"] == "NOTIFY"]
+        self.assertEqual(len(notifies), n_notify)
+
+    def test_duplicate_backfill_to_completed_shipment_counts_once(self):
+        core.complete_shipment(self.db, self.sid, now=2000.0)
+        r1 = self.send("b1", 9.5, 1500.0, now=4000.0)
+        r2 = self.send("b1", 9.5, 1500.0, now=4100.0)  # 补报重发
+        self.assertFalse(r1["duplicated"])
+        self.assertTrue(r2["duplicated"])
+        with dbmod.connect(self.db) as conn:
+            n = conn.execute("SELECT COUNT(*) c FROM telemetry").fetchone()["c"]
+        self.assertEqual(n, 1)
+
+    def test_device_timeline_spans_shipments_and_orphans(self):
+        core.complete_shipment(self.db, self.sid, now=2000.0)
+        ship2 = core.create_shipment(self.db, "第二趟", "dev-1", 2.0, 8.0, 5.0, now=3000.0)
+        self.send("b1", 9.5, 1500.0, now=4000.0)   # 第一趟窗口
+        self.send("b2", 5.0, 2500.0, now=4000.0)   # 空档 → 孤儿
+        self.send("b3", 9.7, 3500.0, now=4000.0)   # 第二趟窗口
+
+        dtl = core.get_device_timeline(self.db, "dev-1")
+        self.assertEqual(dtl["shipments"], [self.sid, ship2["id"]])
+        kinds = [i["kind"] for i in dtl["items"]]
+        self.assertIn("orphan", kinds)
+        # 越限样本按归属带各自任务号
+        v = [i for i in dtl["items"] if i["kind"] == "violation"]
+        self.assertEqual([(i["ts"], i["shipment_id"]) for i in v],
+                         [(1500.0, self.sid), (3500.0, ship2["id"])])
+        # 整体按时间排序：第一趟创建 → 补传样本 → 完成 → 孤儿 → 第二趟创建 → 补传样本
+        ts_list = [i["ts"] for i in dtl["items"]]
+        self.assertEqual(ts_list, sorted(ts_list))
+
+
+class TestBackfillApi(CoreTestBase):
+    """接口视角：孤儿样本可查，设备时间线跨任务合并。"""
+
+    def setUp(self):
+        super().setUp()
+        from server import app as server_app
+        self.app_mod = server_app
+        self._old_db = server_app.DB_PATH
+        server_app.DB_PATH = self.db
+        self.client = server_app.app.test_client()
+
+    def tearDown(self):
+        self.app_mod.DB_PATH = self._old_db
+        super().tearDown()
+
+    def test_orphans_and_device_timeline_endpoints(self):
+        core.complete_shipment(self.db, self.sid, now=2000.0)
+        ship2 = core.create_shipment(self.db, "第二趟", "dev-1", 2.0, 8.0, 5.0, now=3000.0)
+        self.send("b1", 9.5, 1500.0, now=4000.0)
+        self.send("b2", 5.0, 2500.0, now=4000.0)
+
+        orphans = self.client.get("/api/telemetry/orphans?device_id=dev-1").get_json()
+        self.assertEqual(len(orphans), 1)
+        self.assertEqual(orphans[0]["msg_id"], "b2")
+
+        dtl = self.client.get("/api/devices/dev-1/timeline").get_json()
+        self.assertEqual(dtl["device_id"], "dev-1")
+        self.assertTrue(any(i["kind"] == "orphan" for i in dtl["items"]))
+        self.assertTrue(any(i["kind"] == "violation" and i.get("shipment_id") == self.sid
+                            for i in dtl["items"]))
+        self.assertTrue(any(i["kind"] == "shipment" and i.get("shipment_id") == ship2["id"]
+                            for i in dtl["items"]))
+
+
 if __name__ == "__main__":
     unittest.main()

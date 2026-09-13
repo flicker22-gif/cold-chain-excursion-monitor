@@ -57,6 +57,10 @@ class DeviceSim:
             if self.online:
                 break
             time.sleep(0.1)
+        # 采样线程若已被 disconnect() 停掉则重新拉起：seq 单调递增，msg_id 不会重复
+        if self._thread is not None and not self._thread.is_alive():
+            self._stop.clear()
+            self.start()
 
     def drop_network(self):
         """模拟断网：直接掐掉 socket（不发送 DISCONNECT），broker 走 LWT 判离线。"""

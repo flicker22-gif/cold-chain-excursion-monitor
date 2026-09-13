@@ -10,15 +10,18 @@
 ```
 server/
   db.py          # SQLite 表结构：任务 / 温度数据 / 告警（含级别与负责人）/ 处理记录 / 设备状态
-  core.py        # 核心业务：越限判定、告警分级、状态机、超时自动升级、通知去重、迟到数据合并、离线看门狗
+  core.py        # 核心业务：越限判定、告警分级、状态机、超时自动升级、通知去重、迟到数据合并、
+                 #   跨任务补传归属、离线看门狗
   mqtt_ingest.py # MQTT 订阅端（telemetry / status 两个 topic）+ 离线/升级看门狗线程
   broker.py      # 内嵌 MQTT broker（amqtt，纯 Python，无需 Docker/mosquitto）
-  app.py         # Flask API + 单页看板（任务、告警操作、异常时间线）
+  app.py         # Flask API + 单页看板（任务、告警操作、异常时间线、设备跨任务时间线）
 simulator/
   device_sim.py  # 车载设备模拟器：断网本地缓存、恢复补传、历史消息重发
-demo.py          # 一键演示：完整跑一趟"超温→分级→自动升级→处理→断网→补传→迟到数据"的运输
+demo.py          # 一键演示：完整跑一趟"超温→分级→自动升级→处理→断网→补传→迟到数据"的运输，
+                 #   外加断网横跨两趟任务的补传分窗与跨任务时间线
 tests/
-  test_core.py   # 去重、分级、自动升级、通知去重、迟到不重开不重升、离线恢复/继承、状态机等 43 个用例
+  test_core.py   # 去重、分级、自动升级、通知去重、迟到不重开不重升、离线恢复/继承、
+                 # 跨任务补传归属、孤儿样本留存等 49 个用例
 ```
 
 ## 运行
@@ -43,9 +46,20 @@ python3 -m server.app --with-broker --http-port 5090 --mqtt-port 1883
 
 ## 关键设计
 
-**断网数据不丢**：样本带设备侧采样时刻 `ts` 和唯一 `msg_id`。设备断网时在本地缓存
-（`DeviceSim.buffer`），恢复后原样补传；服务端按到达时间与采样时间的差值标记
-`backfilled`，时间线里能看到哪些是补传的。
+**断网数据不丢，补传各归各趟**：样本带设备侧采样时刻 `ts` 和唯一 `msg_id`。设备断网时在本地缓存
+（`DeviceSim.buffer`），恢复后原样补传。服务端按 `ts` 落窗归属：采样时刻落在哪趟任务的
+`[created_at, finished_at]` 窗口内就归哪趟——**哪怕那趟已经完成**；一段断网横跨两趟任务时，
+缓存样本按各自窗口分别落到对应的任务上，不会全堆在当前在途的那趟。到达时刻与采样时刻差值
+超过阈值标记 `backfilled`，时间线里能看到哪些是补传的（任务完成后补传的会特别标注）。
+
+- 落到**已完成**任务的样本只能修正统计和时间线：越限样本落在某张告警的异常窗口内 → 并入该单
+  （刷新峰值/窗口）并记 `LATE_DATA` 留痕，状态、级别、负责人、通知记录全部冻结；窗口外只留
+  样本本身。绝不开新告警、绝不改级别、绝不换负责人。
+- 哪个窗口都不在的样本（两趟之间的空档、任务开始前/结束后）按**孤儿样本**留存
+  （`shipment_id=NULL`），`GET /api/telemetry/orphans` 可查，绝不开告警。
+- 全程按 `(device_id, msg_id)` 唯一约束去重，重复补传仍然只算一次。
+- `GET /api/devices/<id>/timeline` 给出设备视角的跨任务完整时间线：各趟任务节点、告警事件、
+  越限样本、孤儿样本按时间合并，断网横跨几趟任务的补传全程可回放。
 
 **重复消息不重复报警**：
 - 温度数据按 `(device_id, msg_id)` 唯一约束去重，`INSERT OR IGNORE`，QoS1 重传、
@@ -95,6 +109,8 @@ python3 -m server.app --with-broker --http-port 5090 --mqtt-port 1883
 | POST | `/api/shipments` | 建运输任务 `{name, device_id, temp_min, temp_max, offline_grace_sec, escalation_chain, escalate_after_sec}`（同设备在途任务幂等） |
 | POST | `/api/shipments/<id>/complete` | 完成任务（幂等） |
 | GET  | `/api/shipments` · `/api/shipments/<id>/timeline` | 任务列表 · 异常时间线 |
+| GET  | `/api/devices/<id>/timeline` | 设备视角跨任务完整时间线（含孤儿样本） |
+| GET  | `/api/telemetry/orphans?device_id=` | 无任务窗口的留存样本 |
 | GET  | `/api/alerts?status=open&shipment_id=` | 告警列表（含 `severity` / `assignee`） |
 | POST | `/api/alerts/<id>/ack` · `/escalate` · `/resolve` | 确认 / 升级（沿链推进负责人）/ 关闭（非法迁移返回 409） |
 | POST | `/api/alerts/<id>/notes` | 追加处理记录 |

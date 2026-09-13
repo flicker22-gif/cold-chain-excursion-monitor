@@ -4,7 +4,9 @@
 同级通知不重复）→ 处理关闭 → 断网（离线告警、本地缓存）→ 恢复（补传不丢、离线单
 自动关闭留恢复记录、超温单不被顺手关掉、重复上线幂等）→ 断网期间的严重超温开新单
 → 重复消息去重 → 迟到数据并入已关闭告警（不重开、不重新升级）→ 完成任务
-→ 设备离线状态下创建下一趟：新任务继承离线状态，宽限期后告警，恢复后自动关闭。
+→ 设备离线状态下创建下一趟：新任务继承离线状态，宽限期后告警，恢复后自动关闭
+→ 断网横跨两趟任务：缓存样本按采样时刻分别落窗（已完成任务只修正统计、空档样本
+留存为孤儿、在途任务正常开单）→ 设备视角的跨任务完整时间线。
 
   python3 demo.py
 """
@@ -210,8 +212,97 @@ def main():
     sim.connect()
     wait_for("继承的离线告警自动关闭", lambda: api(f"/api/alerts/{off3['id']}")["status"] == "RESOLVED")
     log("设备恢复上线，继承的离线告警自动关闭（AUTO_RESOLVED 留痕）✅")
-    sim.disconnect()
     api(f"/api/shipments/{ship2['id']}/complete", "POST")
+    log(f"任务 #{ship2['id']} 完成")
+
+    # 12. 断网横跨两趟任务：缓存样本按采样时刻分别落窗——已完成任务只修正统计，
+    #     两趟之间空档的样本留存为孤儿，在途任务正常开单
+    ship3 = api("/api/shipments", "POST", {
+        "name": "疫苗运输·沪A12345（第三程）", "device_id": "truck-01",
+        "temp_min": 2.0, "temp_max": 8.0, "offline_grace_sec": 2.0,
+        "escalation_chain": ["调度员-王芳", "值班经理-李强", "运营总监-赵敏"],
+        "escalate_after_sec": 2.0})
+    sid3 = ship3["id"]
+    log(f"创建任务 #{sid3}（第三程），设备在线正常运输")
+    time.sleep(1.5)
+
+    sim.temp_fn = lambda t, s: 11.5
+    sim.drop_network()
+    log("📵 车辆再次断网！温度 11.5℃，设备本地缓存 …")
+    time.sleep(1.5)  # 这段缓存样本落在第三程窗口内
+
+    api(f"/api/shipments/{sid3}/complete", "POST")
+    log(f"任务 #{sid3} 到达任务点完成运输——车还在断网，缓存数据尚未传上来")
+    time.sleep(1.0)  # 两趟之间的空档：这段缓存样本没有对应任务
+
+    ship4 = api("/api/shipments", "POST", {
+        "name": "疫苗运输·沪A12345（第四程）", "device_id": "truck-01",
+        "temp_min": 2.0, "temp_max": 8.0, "offline_grace_sec": 2.0,
+        "escalation_chain": ["调度员-王芳", "值班经理-李强", "运营总监-赵敏"],
+        "escalate_after_sec": 2.0})
+    sid4 = ship4["id"]
+    log(f"创建任务 #{sid4}（第四程），设备仍在断网缓存")
+    time.sleep(1.5)  # 这段缓存样本落在第四程窗口内
+
+    sim.connect()
+    log("📶 网络恢复，断网期间缓存的样本一次性补传上来（横跨三段时间）…")
+    time.sleep(2.0)
+
+    # 落在已完成第三程窗口内的样本：只进时间线/修正统计，绝不开新告警
+    assert not [a for a in api(f"/api/alerts?shipment_id={sid3}") if a["type"] == "TEMP_HIGH"], \
+        "已完成任务上的补传越限不能开新告警"
+    tl3 = api(f"/api/shipments/{sid3}/timeline")
+    assert any(i["kind"] == "violation" and i["backfilled"] for i in tl3["items"])
+    log(f"补传样本落到已完成任务 #{sid3}：只进时间线，不开新告警、不动级别/负责人 ✅")
+
+    # 空档样本：留存为孤儿，接口可查；重复补传仍只算一次
+    orphans = api("/api/telemetry/orphans?device_id=truck-01")
+    assert orphans, "两趟之间空档的样本应留存为孤儿"
+    log(f"两趟之间空档的 {len(orphans)} 条样本没有对应任务：按孤儿留存，接口可查 ✅")
+    o0 = orphans[0]
+    sim.send_raw(msg_id=o0["msg_id"], temp=o0["temp"], ts=o0["device_ts"])
+    time.sleep(1.0)
+    assert len(api("/api/telemetry/orphans?device_id=truck-01")) == len(orphans)
+    log("孤儿样本重复补传：服务端去重，仍只算一次 ✅")
+
+    # 落在第四程窗口内的样本：任务在途，正常开单
+    a4 = wait_for("第四程补传越限开单", lambda: next(
+        (a for a in api(f"/api/alerts?shipment_id={sid4}") if a["type"] == "TEMP_HIGH"), None))
+    log(f"⚠ 补传样本落到在途任务 #{sid4}：正常开告警 #{a4['id']} TEMP_HIGH（{a4['severity']}）")
+
+    # 任务完成后又有迟到数据落入已关闭告警窗口：只修正统计，状态/级别/负责人冻结
+    a1_now = api(f"/api/alerts/{a1['id']}")
+    late_ts = (a1_now["first_ts"] + a1_now["last_ts"]) / 2
+    sim.send_raw(msg_id="truck-01-late-0002", temp=10.8, ts=late_ts)
+    time.sleep(1.0)
+    a1_after = api(f"/api/alerts/{a1['id']}")
+    assert a1_after["status"] == "RESOLVED", "已关闭告警不能被迟到数据改回"
+    assert a1_after["severity"] == a1_now["severity"], "迟到数据不能改变已处理告警的级别"
+    assert a1_after["assignee"] == a1_now["assignee"], "迟到数据不能改变已处理告警的负责人"
+    assert a1_after["peak_temp"] == max(a1_now["peak_temp"], 10.8), "统计应被修正"
+    log(f"任务 #{sid} 完成后又有迟到数据落入告警 #{a1['id']} 窗口：峰值修正为 "
+        f"{a1_after['peak_temp']}℃，状态/级别/负责人冻结 ✅")
+
+    sim.temp_fn = lambda t, s: 5.0
+    time.sleep(1.0)
+    api(f"/api/alerts/{a4['id']}/resolve", "POST",
+        {"actor": "调度员-王芳", "note": "补传数据确认，现场已处理"})
+    sim.disconnect()
+    api(f"/api/shipments/{sid4}/complete", "POST")
+
+    # 13. 设备视角的跨任务完整时间线：断网横跨几趟任务的补传全程
+    log("运输全部完成。设备视角的跨任务完整时间线（含孤儿样本）：\n")
+    dtl = api("/api/devices/truck-01/timeline")
+    base = dtl["items"][0]["ts"]
+    dev_icon = {"shipment": "🚚", "violation": "🌡", "alert_event": "📋", "orphan": "📦"}
+    for it in dtl["items"]:
+        head = ""
+        if it["kind"] == "alert_event":
+            head = f"[告警#{it['alert_id']} {it['alert_type']}·{it['action']}" + \
+                   (f"·{it['actor']}" if it.get("actor") else "") + "] "
+        tag = f"#{it['shipment_id']}" if it.get("shipment_id") else "无任务"
+        print(f"  +{it['ts'] - base:6.1f}s [{tag:>5}] {dev_icon.get(it['kind'], '·')} "
+              f"{head}{it['text']}")
 
     print(f"\n看板地址（单独起服务可看实时页面）：python3 -m server.app --with-broker")
     print("演示结束。")
